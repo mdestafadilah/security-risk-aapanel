@@ -20,7 +20,7 @@ import tempfile
 import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PLUGIN = os.path.join(os.path.dirname(HERE), 'securityrisk')
+PLUGIN = os.path.join(os.path.dirname(HERE), 'src')
 MAIN = os.path.join(PLUGIN, 'securityrisk_main.py')
 
 PASSED = []

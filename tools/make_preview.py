@@ -15,7 +15,7 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SRC = os.path.join(ROOT, 'securityrisk', 'index.html')
+SRC = os.path.join(ROOT, 'src', 'index.html')
 OUT_DIR = os.path.join(ROOT, 'preview')
 OUT = os.path.join(OUT_DIR, 'index.html')
 

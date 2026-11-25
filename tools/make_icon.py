@@ -12,7 +12,7 @@ import zlib
 import struct
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(HERE), 'securityrisk', 'icon.png')
+OUT = os.path.join(os.path.dirname(HERE), 'src', 'icon.png')
 
 SIZE = 128
 SS = 4  # supersampling factor

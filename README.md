@@ -9,11 +9,15 @@ Dokumentasi plugin yang dipakai sebagai acuan: `aaPanel Linux Panel Plug-in
 development documentation v1.1` (struktur file, `info.json`, kelas
 `<nama>_main`, route `/plugin?action=a&name=<nama>&s=<method>`, dan `public`).
 
+Kode plugin ada di `src/`. Di server, folder itu harus bernama `securityrisk`
+(sama dengan `name` di `info.json`); `tools/make_zip.py` mengemasnya dengan
+nama tersebut.
+
 ```
-securityrisk/
+src/                       # terpasang sebagai /www/server/panel/plugin/securityrisk
 ├── securityrisk_main.py   # backend: rule engine + fix engine
 ├── index.html             # frontend: daftar risiko, tombol Resolve, riwayat
-├── info.json              # metadata plugin (name harus = nama folder)
+├── info.json              # metadata plugin (name = nama folder saat terpasang)
 ├── icon.png               # 128x128
 ├── install.sh             # dipanggil panel saat instalasi
 └── uninstall.sh           # pembersihan (backup dipertahankan kecuali --purge)
@@ -140,6 +144,12 @@ jadi tidak bisa membuka server sungguhan.
 host panel (termasuk `X-Forwarded-Host` bila di belakang reverse proxy).
 
 ## Instalasi
+
+Buat paketnya dulu di mesin pengembang:
+
+```bash
+python tools/make_zip.py        # src/ -> dist/securityrisk.zip (folder securityrisk/)
+```
 
 Manual (paling mudah untuk pengembangan):
 
