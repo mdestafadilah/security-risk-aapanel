@@ -57,6 +57,15 @@ def read(root, rel):
 
 
 def build_fixture(root):
+    write(root, 'etc/os-release', (
+        'NAME="Ubuntu"\n'
+        'VERSION="22.04.4 LTS (Jammy Jellyfish)"\n'
+        'ID=ubuntu\n'
+        'ID_LIKE=debian\n'
+        'PRETTY_NAME="Ubuntu 22.04.4 LTS"\n'
+        'VERSION_ID="22.04"\n'
+    ))
+    write(root, 'www/server/panel/data/port.pl', '8888')
     write(root, 'etc/profile', (
         '# /etc/profile\n'
         'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin\n'
@@ -90,6 +99,35 @@ def build_fixture(root):
         'PasswordAuthentication yes\n'
         'UsePAM yes\n'
     ), 0o600)
+
+
+def build_rhel_fixture(root):
+    write(root, 'etc/os-release', (
+        'NAME="Rocky Linux"\n'
+        'VERSION="9.4 (Blue Onyx)"\n'
+        'ID="rocky"\n'
+        'ID_LIKE="rhel centos fedora"\n'
+        'PRETTY_NAME="Rocky Linux 9.4 (Blue Onyx)"\n'
+        'VERSION_ID="9.4"\n'
+    ))
+    write(root, 'www/server/panel/data/port.pl', '12345')
+    write(root, 'etc/profile', 'export PATH=/usr/local/sbin:/usr/bin\n')
+    write(root, 'etc/sudoers', (
+        'Defaults\tenv_reset\n'
+        'root\tALL=(ALL:ALL) ALL\n'
+        '%wheel\tALL=(ALL) ALL\n'
+        '#includedir /etc/sudoers.d\n'
+    ), 0o440)
+    write(root, 'etc/passwd', 'root:x:0:0:root:/root:/bin/bash\n')
+    write(root, 'etc/group', 'root:x:0:\nwheel:x:10:\n')
+    write(root, 'etc/shadow', 'root:$6$xyz$hash:19000:0:99999:7:::\n', 0o600)
+    write(root, 'etc/ssh/sshd_config', (
+        'Port 22\n'
+        'PermitRootLogin no\n'
+        'PasswordAuthentication no\n'
+    ), 0o600)
+    write(root, 'etc/selinux/config', 'SELINUX=enforcing\nSELINUXTYPE=targeted\n')
+    write(root, 'sys/fs/selinux/enforce', '1')
 
 
 def load_module(root, data_dir):
@@ -235,6 +273,84 @@ def main():
     html = app.index({})
     check('index() serves the UI', '<!DOCTYPE html>' in html and 'Security Risk' in html)
     check('class name matches file name', type(app).__name__ == 'securityrisk_main')
+
+    print('\n10. distribution profile - Ubuntu')
+    sysinfo = res['system']
+    check('family detected as debian', sysinfo['family'] == 'debian', sysinfo['family'])
+    check('pretty name shown', sysinfo['os'] == 'Ubuntu 22.04.4 LTS', sysinfo['os'])
+    check('version parsed', sysinfo['os_version'] == '22.04')
+    check('apt chosen as package manager', sysinfo['pkg'] == 'apt-get', sysinfo['pkg'])
+    check('ufw chosen as firewall', sysinfo['firewall'] == 'ufw')
+    check('ssh unit is "ssh"', sysinfo['ssh_service'] == 'ssh')
+    check('admin group is sudo', sysinfo['sudo_group'] == 'sudo')
+    check('panel port read from port.pl', sysinfo['panel_port'] == '8888')
+    check('apparmor check present on debian family', 'apparmor' in items)
+    check('selinux check skipped on debian family', 'selinux' not in items)
+    check('firewall commands are ufw specific',
+          any(c.startswith('ufw ') for c in items['firewall']['commands']),
+          str(items['firewall']['commands']))
+    check('firewall commands use the real panel port',
+          any('8888' in c for c in items['firewall']['commands']))
+    check('fail2ban install uses apt',
+          any(c.startswith('apt-get') for c in items['fail2ban']['commands']))
+    # a fresh NOPASSWD rule so the risk branch (not the "no action" branch) is inspected
+    write(root, 'etc/sudoers.d/91-test', 'tester ALL=(ALL) NOPASSWD: ALL\n', 0o440)
+    items_os = {i['id']: i for i in app.get_index({})['items']}
+    check('sudo risk returns for the new rule', items_os['sudo_nopasswd']['status'] == 'risk')
+    check('sudo advice names the %sudo group',
+          '%sudo' in items_os['sudo_nopasswd']['solution'],
+          items_os['sudo_nopasswd']['solution'][:120])
+
+    print('\n11. distribution profile - Rocky Linux')
+    root2 = tempfile.mkdtemp(prefix='secrisk-rhel-')
+    data2 = tempfile.mkdtemp(prefix='secrisk-data2-')
+    build_rhel_fixture(root2)
+    mod2 = load_module(root2, data2)
+    mod2.PERM_RULES = []
+    app2 = mod2.securityrisk_main()
+    res2 = app2.get_index({})
+    sys2 = res2['system']
+    items2 = {i['id']: i for i in res2['items']}
+    check('family detected as rhel', sys2['family'] == 'rhel', sys2['family'])
+    check('rocky name/version parsed',
+          sys2['os_name'] == 'Rocky Linux' and sys2['os_version'] == '9.4',
+          '%s %s' % (sys2['os_name'], sys2['os_version']))
+    check('dnf chosen as package manager', sys2['pkg'] == 'dnf', sys2['pkg'])
+    check('firewalld chosen as firewall', sys2['firewall'] == 'firewalld')
+    check('ssh unit is sshd', sys2['ssh_service'] == 'sshd')
+    check('admin group is wheel', sys2['sudo_group'] == 'wheel')
+    check('selinux check present on rhel family', 'selinux' in items2)
+    check('selinux enforcing reported ok', items2['selinux']['status'] == 'ok',
+          items2['selinux']['detail'])
+    check('apparmor check skipped on rhel family', 'apparmor' not in items2)
+    check('firewall commands are firewalld specific',
+          any('firewall-cmd' in c for c in items2['firewall']['commands']),
+          str(items2['firewall']['commands']))
+    check('firewall commands use port 12345',
+          any('12345' in c for c in items2['firewall']['commands']))
+    check('fail2ban install pulls epel first',
+          any('epel-release' in c for c in items2['fail2ban']['commands']),
+          str(items2['fail2ban']['commands']))
+    check('rocky scan is clean on ssh', items2['ssh_root_login']['status'] == 'ok'
+          and items2['ssh_password_auth']['status'] == 'ok')
+    check('no sudo risk when no NOPASSWD', items2['sudo_nopasswd']['status'] == 'ok')
+
+    print('\n12. unknown distribution falls back safely')
+    root3 = tempfile.mkdtemp(prefix='secrisk-other-')
+    data3 = tempfile.mkdtemp(prefix='secrisk-data3-')
+    write(root3, 'etc/profile', 'export PATH=/usr/bin\n')
+    mod3 = load_module(root3, data3)
+    mod3.PERM_RULES = []
+    app3 = mod3.securityrisk_main()
+    res3 = app3.get_index({})
+    sys3 = res3['system']
+    check('falls back to generic linux', sys3['family'] == 'unknown', sys3['family'])
+    check('generic label used', sys3['family_label'] == 'Generic Linux')
+    check('no apparmor/selinux check without a known family',
+          not any(i['id'] in ('selinux', 'apparmor') for i in res3['items']))
+    check('generic firewall advice still given',
+          any('iptables' in c for i in res3['items'] if i['id'] == 'firewall'
+              for c in i['commands']))
 
     print('\n%d passed, %d failed' % (len(PASSED), len(FAILED)))
     shutil.rmtree(root, ignore_errors=True)

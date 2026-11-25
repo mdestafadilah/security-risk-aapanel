@@ -22,8 +22,9 @@ securityrisk/
 ## Cara kerja
 
 1. **Scan** — `index.html` memanggil `POST /plugin?action=a&name=securityrisk&s=get_index`.
-   Backend menjalankan 9 pemeriksaan langsung terhadap kondisi server
-   (`/etc/profile`, `/etc/sudoers*`, `/etc/ssh/sshd_config`, `/etc/shadow`, dst).
+   Backend mendeteksi distribusi lebih dulu, lalu menjalankan 10 pemeriksaan
+   langsung terhadap kondisi server (`/etc/profile`, `/etc/sudoers*`,
+   `/etc/ssh/sshd_config`, `/etc/shadow`, dst).
 2. **List** — setiap temuan dikembalikan sebagai objek: `title`, `level`
    (`high|medium|low`), `status` (`risk|ok|unknown`), `detail`, `solution`,
    `fixable`, `plan` (daftar perubahan yang akan dilakukan), dan `rules`
@@ -35,6 +36,37 @@ Plugin **tidak** membaca cache hasil "Security Risk" bawaan panel — ia
 memeriksa sendiri kondisi file sistem. Konsekuensinya hasil selalu real-time
 dan tombol Resolve benar-benar bisa mengeksekusi perbaikan, bukan sekadar
 menampilkan teks saran.
+
+## Dukungan distribusi
+
+OS dibaca dari `/etc/os-release` (fallback: `/etc/redhat-release`,
+`/etc/rocky-release`, `/etc/almalinux-release`, `/etc/centos-release`,
+`/etc/debian_version`), lalu dipetakan ke satu *family*. Profilnya dipakai
+untuk semua yang berbeda antar distro, bukan hanya ditampilkan:
+
+| Family | Distro yang dikenali | Paket | Firewall | Unit SSH | Grup admin | MAC |
+|---|---|---|---|---|---|---|
+| `debian` | Debian, Ubuntu, Mint, Kali, Raspbian, Pop!_OS | `apt-get` | `ufw` | `ssh` | `%sudo` | AppArmor |
+| `rhel` | RHEL, **Rocky Linux**, AlmaLinux, CentOS, Fedora, Oracle, Amazon | `dnf` (fallback `yum`) | `firewalld` | `sshd` | `%wheel` | SELinux |
+| `suse` | openSUSE, SLES | `zypper` | `firewalld` | `sshd` | `%wheel` | AppArmor |
+| `alpine` | Alpine | `apk` | `awall` | `sshd` | `%wheel` | — |
+| `arch` | Arch, Manjaro | `pacman` | `nftables` | `sshd` | `%wheel` | AppArmor |
+| `unknown` | distro lain / container minimal | — | saran `iptables` | `sshd` | `%wheel` | — |
+
+Yang ikut menyesuaikan:
+
+- **Perintah firewall** memakai backend distro (ufw vs `firewall-cmd` vs
+  `iptables`) dan **port panel asli** dari `/www/server/panel/data/port.pl`,
+  bukan 8888 hard-code.
+- **Instalasi fail2ban** memakai paket manager yang ada; di RHEL/Rocky
+  ditambahkan `dnf install -y epel-release` lebih dulu karena fail2ban ada di EPEL.
+- **Reload SSH** memakai unit yang benar (`ssh` di Debian/Ubuntu, `sshd` di RHEL).
+- **Saran sudo** menyebut grup admin distro (`%sudo` atau `%wheel`).
+- **Pemeriksaan MAC** hanya muncul bila relevan: `selinux` di family RHEL,
+  `apparmor` di Debian/SUSE. Di distro lain keduanya dilewati, bukan
+  dilaporkan sebagai "unknown".
+- Nama OS, family, paket, firewall, dan grup admin tampil sebagai pill di
+  header UI; temuan yang khas distro diberi badge platform.
 
 ### Pengamanan setiap perbaikan
 
@@ -49,6 +81,8 @@ menampilkan teks saran.
 
 ## Daftar pemeriksaan
 
+11 aturan total, 10 dijalankan pada satu server (selinux *atau* apparmor).
+
 | id | Temuan | Level | Aksi |
 |---|---|---|---|
 | `cli_timeout` | `TMOUT` tidak diset / > 600 detik | medium | **Auto** — menambah `TMOUT=300`, `readonly TMOUT`, `export TMOUT` ke `/etc/profile` (atau memperbaiki nilai yang ada) |
@@ -57,8 +91,10 @@ menampilkan teks saran.
 | `ssh_password_auth` | `PasswordAuthentication yes` | medium | **Auto (berisiko)** — diubah ke `no`; butuh centang konfirmasi karena bisa mengunci login |
 | `file_permissions` | `/etc/shadow`, `/etc/sudoers`, dll. terlalu terbuka | high/medium | **Auto** — `chmod` ke mode standar (hanya bila mode lebih longgar dari seharusnya) |
 | `empty_password` | Akun di `/etc/shadow` tanpa hash | high | **Auto** — `passwd -l <user>` |
-| `firewall` | Tidak ada ufw/firewalld/iptables aktif | medium | Manual — perintah per distro ditampilkan untuk dicopy |
-| `fail2ban` | Tidak terpasang / tidak jalan | medium | Manual — perintah instalasi |
+| `firewall` | Tidak ada ufw/firewalld/iptables aktif | medium | Manual — perintah backend firewall distro ditampilkan untuk dicopy |
+| `fail2ban` | Tidak terpasang / tidak jalan | medium | Manual — perintah instalasi sesuai paket manager (RHEL: EPEL dulu) |
+| `selinux` | SELinux *permissive*/*disabled* (khusus RHEL family) | medium | Manual — `setenforce 1`; untuk `disabled` butuh reboot + relabel |
+| `apparmor` | AppArmor tidak aktif (khusus Debian/SUSE) | low | Manual — install + `systemctl enable --now apparmor` |
 | `panel_ssl` | Panel belum HTTPS (`ssl.pl` tidak ada) | low | Manual — arahkan ke Panel Settings |
 
 Aturan severity mengikuti sumber temuan: `NOPASSWD` dan timeout CLI = *medium*,
@@ -118,15 +154,21 @@ Rule engine tidak bergantung pada path absolut, sehingga bisa diuji di mesin
 pengembang dengan `SECRISK_SYSROOT`:
 
 ```bash
-python tests/test_local.py     # 51 assertion: deteksi, fix, backup, restore
+python tests/test_local.py     # 84 assertion: deteksi, fix, backup, restore, profil OS
 python tools/make_preview.py   # preview/index.html + data contoh untuk review UI
 ```
 
-Hasil uji terakhir: **51 passed, 0 failed** — mencakup deteksi awal, penulisan
+Hasil uji terakhir: **84 passed, 0 failed** — mencakup deteksi awal, penulisan
 `TMOUT`, komentar `NOPASSWD` (termasuk baris lanjutan `\`), penguncian akun,
 penulisan ulang sshd_config (termasuk saat nilainya berasal dari
-`sshd_config.d`), aturan permission, riwayat, dan restore
-byte-for-byte.
+`sshd_config.d`), aturan permission, riwayat, restore byte-for-byte, plus tiga
+fixture distro:
+
+| Fixture | Yang diverifikasi |
+|---|---|
+| Ubuntu 22.04 | family `debian`, `apt-get`, `ufw`, unit `ssh`, `%sudo`, AppArmor aktif, perintah firewall memakai port panel 8888 |
+| Rocky Linux 9.4 | family `rhel`, `dnf`, `firewalld`, unit `sshd`, `%wheel`, SELinux *enforcing* = ok, fail2ban lewat EPEL, port panel 12345 |
+| tanpa os-release | fallback `Generic Linux`, tanpa cek SELinux/AppArmor, saran `iptables` |
 
 ## Catatan
 

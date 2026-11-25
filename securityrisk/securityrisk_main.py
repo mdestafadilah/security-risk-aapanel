@@ -143,6 +143,193 @@ def _glob(pattern):
     return [_strip(p) for p in sorted(glob.glob(_path(pattern)))]
 
 
+# ---------------------------------------------------------------------------
+# operating system profile
+#
+# Every check that has a distro-specific answer (package manager, firewall
+# backend, sshd unit name, admin group, mandatory access control) asks this
+# profile instead of hard coding one distribution's defaults.
+# ---------------------------------------------------------------------------
+
+FAMILIES = {
+    'debian': {
+        'label': 'Debian / Ubuntu',
+        'pkg': 'apt-get',
+        'firewall': 'ufw',
+        'ssh_service': 'ssh',
+        'sudo_group': 'sudo',
+        'mac': 'AppArmor',
+    },
+    'rhel': {
+        'label': 'RHEL / Rocky / Alma',
+        'pkg': 'dnf',
+        'firewall': 'firewalld',
+        'ssh_service': 'sshd',
+        'sudo_group': 'wheel',
+        'mac': 'SELinux',
+    },
+    'suse': {
+        'label': 'SUSE / openSUSE',
+        'pkg': 'zypper',
+        'firewall': 'firewalld',
+        'ssh_service': 'sshd',
+        'sudo_group': 'wheel',
+        'mac': 'AppArmor',
+    },
+    'alpine': {
+        'label': 'Alpine',
+        'pkg': 'apk',
+        'firewall': 'awall',
+        'ssh_service': 'sshd',
+        'sudo_group': 'wheel',
+        'mac': 'None',
+    },
+    'arch': {
+        'label': 'Arch',
+        'pkg': 'pacman',
+        'firewall': 'nftables',
+        'ssh_service': 'sshd',
+        'sudo_group': 'wheel',
+        'mac': 'AppArmor',
+    },
+    'unknown': {
+        'label': 'Generic Linux',
+        'pkg': '',
+        'firewall': '',
+        'ssh_service': 'sshd',
+        'sudo_group': 'wheel',
+        'mac': '',
+    },
+}
+
+ID_FAMILY = {
+    'debian': 'debian', 'ubuntu': 'debian', 'linuxmint': 'debian', 'kali': 'debian',
+    'raspbian': 'debian', 'devuan': 'debian', 'pop': 'debian', 'elementary': 'debian',
+    'zorin': 'debian', 'neon': 'debian', 'mx': 'debian', 'deepin': 'debian',
+    'rhel': 'rhel', 'centos': 'rhel', 'rocky': 'rhel', 'almalinux': 'rhel',
+    'alma': 'rhel', 'fedora': 'rhel', 'ol': 'rhel', 'oracle': 'rhel',
+    'amzn': 'rhel', 'cloudlinux': 'rhel', 'scientific': 'rhel', 'virtuozzo': 'rhel',
+    'opensuse': 'suse', 'opensuse-leap': 'suse', 'opensuse-tumbleweed': 'suse',
+    'sles': 'suse', 'suse': 'suse',
+    'alpine': 'alpine', 'arch': 'arch', 'manjaro': 'arch', 'endeavouros': 'arch',
+}
+
+_OS_CACHE = {'root': None, 'profile': None}
+
+
+def _read_os_release():
+    for path in ('/etc/os-release', '/usr/lib/os-release'):
+        body = _read(path)
+        if not body:
+            continue
+        data = {}
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, val = line.split('=', 1)
+            data[key.strip()] = val.strip().strip('"').strip("'")
+        if data.get('ID') or data.get('NAME'):
+            return data
+    return {}
+
+
+def _family_from_ids(os_id, id_like):
+    for token in [os_id] + (id_like or '').split():
+        token = (token or '').strip().lower()
+        if token in ID_FAMILY:
+            return ID_FAMILY[token]
+    return ''
+
+
+def _has_bin(name):
+    if SYSROOT:
+        return False
+    out, ok = _shell('command -v %s >/dev/null 2>&1 && echo yes' % name)
+    return ok and 'yes' in out
+
+
+def detect_os():
+    """Return a cached profile describing the distribution this plugin runs on."""
+    if _OS_CACHE['root'] == SYSROOT and _OS_CACHE['profile']:
+        return _OS_CACHE['profile']
+
+    data = _read_os_release()
+    os_id = (data.get('ID') or '').lower()
+    id_like = (data.get('ID_LIKE') or '').lower()
+    name = data.get('NAME') or ''
+    version = data.get('VERSION_ID') or ''
+    pretty = data.get('PRETTY_NAME') or ('%s %s' % (name, version)).strip()
+
+    if not os_id:
+        # fall back to the release files older distributions still ship
+        for path, guess in (('/etc/redhat-release', 'rhel'),
+                            ('/etc/rocky-release', 'rocky'),
+                            ('/etc/almalinux-release', 'almalinux'),
+                            ('/etc/centos-release', 'centos'),
+                            ('/etc/debian_version', 'debian'),
+                            ('/etc/SuSE-release', 'suse')):
+            body = _read(path)
+            if body:
+                os_id = guess
+                name = name or body.strip().splitlines()[0]
+                pretty = pretty or body.strip().splitlines()[0]
+                break
+
+    family = _family_from_ids(os_id, id_like) or 'unknown'
+    base = FAMILIES.get(family, FAMILIES['unknown'])
+    profile = {
+        'id': os_id or 'linux',
+        'name': name or base['label'],
+        'version': version,
+        'pretty': pretty or base['label'],
+        'family': family,
+        'label': base['label'],
+        'pkg': base['pkg'],
+        'firewall': base['firewall'],
+        'ssh_service': base['ssh_service'],
+        'sudo_group': base['sudo_group'],
+        'mac': base['mac'],
+        'panel_port': _panel_port(),
+    }
+
+    # refine with what is actually installed when we are on a real machine
+    if not SYSROOT:
+        if family == 'rhel' and profile['pkg'] == 'dnf' and not _has_bin('dnf'):
+            profile['pkg'] = 'yum'
+        if family == 'debian' and not _has_bin('apt-get'):
+            profile['pkg'] = 'apt'
+
+    _OS_CACHE['root'] = SYSROOT
+    _OS_CACHE['profile'] = profile
+    return profile
+
+
+def _panel_port():
+    body = _read('/www/server/panel/data/port.pl')
+    m = re.search(r'\d{2,5}', body or '')
+    return m.group(0) if m else '8888'
+
+
+def _pkg_install(profile, *packages):
+    """Build the install command for the detected package manager."""
+    pkgs = ' '.join(packages)
+    pkg = profile['pkg']
+    if pkg == 'apt-get':
+        return 'apt-get update && apt-get install -y %s' % pkgs
+    if pkg == 'dnf':
+        return 'dnf install -y %s' % pkgs
+    if pkg == 'yum':
+        return 'yum install -y %s' % pkgs
+    if pkg == 'zypper':
+        return 'zypper install -y %s' % pkgs
+    if pkg == 'apk':
+        return 'apk add %s' % pkgs
+    if pkg == 'pacman':
+        return 'pacman -S --noconfirm %s' % pkgs
+    return 'install %s with the package manager of this distribution' % pkgs
+
+
 def _logical_lines(body):
     """Yield (first_index, last_index, joined_text) joining backslash continuations."""
     lines = body.splitlines()
@@ -400,13 +587,16 @@ def check_sudo_nopasswd():
     files = sorted(set(h['file'] for h in hits))
     detail = 'Passwordless sudo is allowed by %d rule(s): %s' % (
         len(hits), ', '.join(files))
+    group = detect_os()['sudo_group']
     return _item(
         'sudo_nopasswd',
         'The following sudo files contain the NOPASSWD flag: %s' % ', '.join(files),
         'medium', 'risk',
         detail,
         'Comment out or remove the NOPASSWD marker in the listed files. Sudo '
-        'will then ask for the user password again. Validate with "visudo -c".',
+        'will then ask for the user password again. Validate with "visudo -c". '
+        'On this distribution the admin group is "%' + group + '", so keep the '
+        'group rule and drop only the NOPASSWD part.',
         fixable=True,
         plan=['Back up %s' % ', '.join(files),
               'Comment out every line that contains NOPASSWD:',
@@ -628,14 +818,18 @@ def _set_ssh_key(key, value):
             raise FixError('Rolled back, "sshd -t" rejected the change: %s'
                            % (out.strip()[:300] or 'unknown error'))
 
+        # Debian/Ubuntu call the unit "ssh", RHEL family calls it "sshd"
+        svc = detect_os()['ssh_service']
+        other = 'ssh' if svc == 'sshd' else 'sshd'
         reload_out, reload_ok = _shell(
-            'systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null '
-            '|| service sshd reload 2>/dev/null || service ssh reload 2>/dev/null')
+            'systemctl reload %(a)s 2>/dev/null || systemctl reload %(b)s 2>/dev/null '
+            '|| service %(a)s reload 2>/dev/null || service %(b)s reload 2>/dev/null'
+            % {'a': svc, 'b': other})
         if reload_ok:
-            changes.append('Reloaded sshd')
+            changes.append('Reloaded %s' % svc)
         else:
-            changes.append('sshd config saved but reload failed - run '
-                           '"systemctl reload sshd" manually')
+            changes.append('Config saved but reload failed - run '
+                           '"systemctl reload %s" manually' % svc)
 
     # confirm the new value is really the effective one, otherwise another file wins
     now, now_src = _ssh_effective(key)
@@ -814,10 +1008,41 @@ def _fix_empty_password():
 
 
 # ---------------------------------------------------------------------------
-# check 7 - firewall
+# check 7 - firewall (backend depends on the distribution)
 # ---------------------------------------------------------------------------
 
+def _firewall_commands(profile):
+    port = profile['panel_port']
+    fam = profile['family']
+    if fam == 'debian':
+        return [
+            'ufw allow 22/tcp',
+            'ufw allow %s/tcp' % port,
+            'ufw --force enable',
+            'ufw status verbose',
+        ]
+    if fam in ('rhel', 'suse'):
+        return [
+            'firewall-cmd --permanent --add-service=ssh',
+            'firewall-cmd --permanent --add-port=%s/tcp' % port,
+            'firewall-cmd --reload',
+            'firewall-cmd --state',
+        ]
+    if fam == 'alpine':
+        return [
+            'apk add awall',
+            'awall enable',
+            'awall activate',
+        ]
+    return [
+        'iptables -A INPUT -p tcp --dport 22 -j ACCEPT',
+        'iptables -A INPUT -p tcp --dport %s -j ACCEPT' % port,
+        'iptables -P INPUT DROP',
+    ]
+
+
 def check_firewall():
+    profile = detect_os()
     evidence = []
     active = False
 
@@ -846,18 +1071,21 @@ def check_firewall():
             'low', 'ok',
             '; '.join(evidence) or 'Firewall detected.',
             'No action needed.',
+            extra={'platform': profile['label']},
         )
+
+    backend = profile['firewall'] or 'iptables'
     return _item(
         'firewall',
         'No host firewall is enabled',
         'medium', 'risk',
-        'Neither firewalld, ufw nor iptables rules were detected.',
-        'Enable the firewall of your distribution and allow only the ports you '
-        'actually use (SSH, panel port, HTTP/HTTPS).',
-        commands=[
-            'ufw allow 22/tcp && ufw allow 8888/tcp && ufw --force enable   # Debian/Ubuntu',
-            'firewall-cmd --permanent --add-service=ssh && firewall-cmd --reload   # RHEL/Alma/Rocky',
-        ],
+        'Neither %s nor any other packet filter was found active on %s.'
+        % (backend, profile['pretty'] or profile['label']),
+        'Enable %s (the firewall %s ships with) and allow only the ports you '
+        'actually use: SSH, the panel port %s, and HTTP/HTTPS if you serve sites.'
+        % (backend, profile['label'], profile['panel_port']),
+        commands=_firewall_commands(profile),
+        extra={'platform': profile['label']},
     )
 
 
@@ -866,6 +1094,7 @@ def check_firewall():
 # ---------------------------------------------------------------------------
 
 def check_fail2ban():
+    profile = detect_os()
     installed = _exists('/etc/fail2ban') or _exists('/etc/fail2ban/jail.conf')
     running = False
     if not SYSROOT:
@@ -878,7 +1107,16 @@ def check_fail2ban():
             'low', 'ok',
             'Fail2ban configuration found at /etc/fail2ban.',
             'No action needed. Make sure the sshd jail is enabled.',
+            extra={'platform': profile['label']},
         )
+
+    if profile['family'] == 'rhel':
+        cmds = ['dnf install -y epel-release', _pkg_install(profile, 'fail2ban'),
+                'systemctl enable --now fail2ban', 'fail2ban-client status sshd']
+    else:
+        cmds = [_pkg_install(profile, 'fail2ban'),
+                'systemctl enable --now fail2ban', 'fail2ban-client status sshd']
+
     return _item(
         'fail2ban',
         'Fail2ban is not protecting the server',
@@ -887,11 +1125,8 @@ def check_fail2ban():
         'blocked at the IP level.',
         'Install fail2ban and enable the sshd jail. aaPanel also ships an SSH '
         'brute-force protection module you can use instead.',
-        commands=[
-            'apt-get install -y fail2ban && systemctl enable --now fail2ban   # Debian/Ubuntu',
-            'yum install -y fail2ban && systemctl enable --now fail2ban       # RHEL/Alma/Rocky',
-            'fail2ban-client status sshd',
-        ],
+        commands=cmds,
+        extra={'platform': profile['label']},
     )
 
 
@@ -920,6 +1155,110 @@ def check_panel_ssl():
 
 
 # ---------------------------------------------------------------------------
+# check 9/10 - mandatory access control (only on the families that ship one)
+# ---------------------------------------------------------------------------
+
+def check_selinux():
+    profile = detect_os()
+    if profile['family'] != 'rhel':
+        return None
+
+    mode = None
+    body = _read('/etc/selinux/config')
+    if body:
+        m = re.search(r'^\s*SELINUX\s*=\s*(\w+)', body, re.M)
+        if m:
+            mode = m.group(1).lower()
+    enforce = _read('/sys/fs/selinux/enforce')
+    if enforce is not None and enforce.strip() in ('0', '1'):
+        mode = 'enforcing' if enforce.strip() == '1' else 'permissive'
+
+    if mode is None:
+        return _item(
+            'selinux',
+            'SELinux state could not be read',
+            'low', 'unknown',
+            'Neither /etc/selinux/config nor /sys/fs/selinux could be read.',
+            'Run "sestatus" on the server to check it manually.',
+            extra={'platform': profile['label']},
+        )
+    if mode == 'enforcing':
+        return _item(
+            'selinux',
+            'SELinux is enforcing',
+            'low', 'ok',
+            'SELINUX=%s on %s.' % (mode, profile['pretty'] or profile['label']),
+            'No action needed.',
+            extra={'platform': profile['label']},
+        )
+    if mode == 'permissive':
+        return _item(
+            'selinux',
+            'SELinux is permissive (only logs, never blocks)',
+            'medium', 'risk',
+            'SELINUX=permissive on %s: violations are logged but not denied, so a '
+            'compromised service is not contained.' % (profile['pretty'] or profile['label']),
+            'Switch to enforcing after checking "ausearch -m AVC -ts recent" for '
+            'denials, so the change does not break a running service.',
+            commands=['setenforce 1',
+                      "sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config",
+                      'sestatus'],
+            extra={'platform': profile['label']},
+        )
+    return _item(
+        'selinux',
+        'SELinux is disabled',
+        'medium', 'risk',
+        'SELINUX=%s: the kernel provides no mandatory access control on %s.'
+        % (mode, profile['pretty'] or profile['label']),
+        'Enabling SELinux on an already installed system needs a reboot and a full '
+        'relabel ("touch /.autorelabel"), which can take a long time. Plan it in a '
+        'maintenance window, not during business hours.',
+        commands=["sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config",
+                  'touch /.autorelabel',
+                  'reboot'],
+        extra={'platform': profile['label']},
+    )
+
+
+def check_apparmor():
+    profile = detect_os()
+    if profile['family'] not in ('debian', 'suse'):
+        return None
+
+    enabled = False
+    body = _read('/sys/module/apparmor/parameters/enabled')
+    if body and body.strip().lower().startswith('y'):
+        enabled = True
+    if not SYSROOT:
+        out, ok = _shell('aa-status --enabled 2>/dev/null')
+        if ok and not out.strip():
+            enabled = True
+
+    if enabled:
+        return _item(
+            'apparmor',
+            'AppArmor is enabled',
+            'low', 'ok',
+            'The kernel AppArmor module is active on %s.' % (profile['pretty'] or profile['label']),
+            'No action needed.',
+            extra={'platform': profile['label']},
+        )
+    return _item(
+        'apparmor',
+        'AppArmor is not active',
+        'low', 'risk',
+        'No AppArmor profiles are enforced, so services are not confined if they '
+        'are compromised. Debian installs it only when asked.',
+        'Install AppArmor and enable it; Ubuntu ships it enabled by default.',
+        commands=[_pkg_install(profile, 'apparmor', 'apparmor-utils'),
+                  'systemctl enable --now apparmor',
+                  'aa-status'],
+        extra={'platform': profile['label']},
+    )
+
+
+# ---------------------------------------------------------------------------
 # engine
 # ---------------------------------------------------------------------------
 
@@ -932,6 +1271,8 @@ CHECKS = [
     check_empty_password,
     check_firewall,
     check_fail2ban,
+    check_selinux,
+    check_apparmor,
     check_panel_ssl,
 ]
 
@@ -952,10 +1293,12 @@ def run_checks():
     items = []
     for fn in CHECKS:
         try:
-            items.append(fn())
+            item = fn()
         except Exception as exc:  # a broken check must not kill the scan
-            items.append(_item(fn.__name__, 'Check failed to run', 'low', 'unknown',
-                               str(exc), 'Report this to the plugin author.'))
+            item = _item(fn.__name__, 'Check failed to run', 'low', 'unknown',
+                         str(exc), 'Report this to the plugin author.')
+        if item:  # checks that do not apply to this distribution return None
+            items.append(item)
     items.sort(key=lambda i: (STATUS_WEIGHT.get(i['status'], 3),
                               LEVEL_WEIGHT.get(i['level'], 3)))
     summary = {
@@ -972,16 +1315,28 @@ def run_checks():
 
 
 def _system_info():
-    info = {'hostname': '', 'os': '', 'kernel': '', 'panel': ''}
+    profile = detect_os()
+    info = {
+        'hostname': '',
+        'os': profile['pretty'],
+        'os_id': profile['id'],
+        'os_name': profile['name'],
+        'os_version': profile['version'],
+        'family': profile['family'],
+        'family_label': profile['label'],
+        'pkg': profile['pkg'],
+        'firewall': profile['firewall'],
+        'ssh_service': profile['ssh_service'],
+        'sudo_group': profile['sudo_group'],
+        'mac': profile['mac'],
+        'panel_port': profile['panel_port'],
+        'kernel': '',
+        'panel': '',
+    }
     try:
         info['hostname'] = os.uname()[1] if hasattr(os, 'uname') else os.environ.get('COMPUTERNAME', '')
     except Exception:
         pass
-    body = _read('/etc/os-release', '')
-    for line in body.splitlines():
-        if line.startswith('PRETTY_NAME='):
-            info['os'] = line.split('=', 1)[1].strip().strip('"')
-            break
     if not SYSROOT:
         out, ok = _shell('uname -r')
         if ok:
@@ -997,7 +1352,7 @@ def _find(risk_id):
             item = fn()
         except Exception:
             continue
-        if item['id'] == risk_id:
+        if item and item['id'] == risk_id:
             return item
     return None
 

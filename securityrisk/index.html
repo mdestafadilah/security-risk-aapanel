@@ -48,6 +48,9 @@ body{
 .logo svg{width:26px;height:26px;display:block}
 h1{font-size:19px;line-height:1.2;margin:0 0 2px;font-weight:650;letter-spacing:-.2px}
 .sub{color:var(--muted);font-size:12.5px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pills{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}
+.pill{font-size:11px;font-weight:600;color:#5b6472;background:#eceff4;border-radius:999px;padding:2px 8px;white-space:nowrap}
+.pill.os{background:var(--accent-soft);color:var(--accent-dark)}
 .actions{display:flex;align-items:center;gap:10px}
 .scanned{color:var(--muted);font-size:12.5px;text-align:right;line-height:1.35}
 
@@ -125,6 +128,7 @@ h1{font-size:19px;line-height:1.2;margin:0 0 2px;font-weight:650;letter-spacing:
 .badge.ok{background:var(--accent-soft);color:var(--accent-dark)}
 .badge.auto{background:#f1f3f7;color:var(--ink-2)}
 .badge.manual{background:#fff;color:var(--muted);border:1px solid var(--line)}
+.badge.os{background:#eef2ff;color:#4338ca}
 
 .card-detail{color:var(--ink-2);font-size:13px;margin:6px 0 0;word-break:break-word}
 .sol{
@@ -247,6 +251,7 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
       <div style="min-width:0">
         <h1>Security Risk</h1>
         <p class="sub" id="sysline">Reading server profile…</p>
+        <div class="pills" id="syspills"></div>
       </div>
     </div>
     <div class="actions">
@@ -368,10 +373,22 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
   function renderHeader() {
     var s = STATE.system || {};
     var bits = [];
-    if (s.hostname) bits.push(s.hostname);
     if (s.os) bits.push(s.os);
+    if (s.hostname) bits.push(s.hostname);
     if (s.kernel) bits.push('kernel ' + s.kernel);
     $('sysline').textContent = bits.length ? bits.join(' · ') : 'Server security audit';
+    $('sysline').title = $('sysline').textContent;
+
+    var pills = [];
+    if (s.family_label) pills.push({ t: s.family_label, c: 'pill os' });
+    if (s.pkg) pills.push({ t: 'pkg: ' + s.pkg, c: 'pill' });
+    if (s.firewall) pills.push({ t: 'firewall: ' + s.firewall, c: 'pill' });
+    if (s.mac && s.mac !== 'None') pills.push({ t: s.mac, c: 'pill' });
+    if (s.sudo_group) pills.push({ t: 'admin: %' + s.sudo_group, c: 'pill' });
+    $('syspills').innerHTML = pills.map(function (p) {
+      return '<span class="' + p.c + '">' + esc(p.t) + '</span>';
+    }).join('');
+
     $('scanned').innerHTML = STATE.scanTime
       ? 'Last scan<br><b>' + esc(ago(STATE.scanTime)) + '</b>'
       : '';
@@ -380,7 +397,9 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
   function renderStats() {
     var s = STATE.summary || {};
     var cards = [
-      { k: 'Checks run', v: s.total || 0, n: 'live server state', cls: '' },
+      { k: 'Checks run', v: s.total || 0,
+        n: (STATE.system && STATE.system.family_label)
+          ? STATE.system.family_label + ' host' : 'live server state', cls: '' },
       { k: 'Risks found', v: s.risk || 0, n: (s.high || 0) + ' high · ' + (s.medium || 0) + ' medium · ' + (s.low || 0) + ' low', cls: 'risk' },
       { k: 'One-click fixes', v: s.fixable || 0, n: 'available right now', cls: 'fix' },
       { k: 'Passed', v: s.ok || 0, n: 'no action needed', cls: 'ok' }
@@ -436,6 +455,7 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
         (item.fixable ? 'Auto-fix' : 'Manual') + '</span>' +
         (item.danger ? '<span class="badge high">lockout risk</span>' : '')
       : '';
+    var osBadge = item.platform ? '<span class="badge os">' + esc(item.platform) + '</span>' : '';
 
     var rules = '';
     if (item.rules && item.rules.length) {
@@ -463,7 +483,7 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
     return '<article class="card" data-level="' + esc(level) + '" data-status="' + esc(item.status) + '">' +
       '<div class="card-head">' +
         '<h2 class="card-title">' + esc(item.title) + '</h2>' +
-        '<div class="badges">' + badge + mode + '</div>' +
+        '<div class="badges">' + badge + mode + osBadge + '</div>' +
       '</div>' +
       '<p class="card-detail">' + esc(item.detail) + '</p>' +
       rules + sol +

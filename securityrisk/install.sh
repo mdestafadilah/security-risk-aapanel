@@ -24,6 +24,13 @@ chmod +x "${plugin_path}"/*.sh 2>/dev/null
 
 find "${plugin_path}" -name "*.pyc" -delete 2>/dev/null
 
+# report the distribution so the install log shows which rule set will be used
+if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    echo "Detected OS: ${PRETTY_NAME:-${NAME:-unknown} ${VERSION_ID:-}} (id=${ID:-unknown})"
+fi
+
 # the panel imports the plugin with python3; make the requirement visible early
 if command -v python3 >/dev/null 2>&1; then
     python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)" \
