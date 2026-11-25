@@ -1,0 +1,9 @@
+{
+  "title": "Security Risk",
+  "name": "securityrisk",
+  "ps": "Audit server hardening gaps (shell timeout, passwordless sudo, SSH, file permissions, empty passwords, firewall, fail2ban, panel SSL) and fix them with one click. Every change is backed up, validated and rollback-safe.",
+  "versions": "1.0",
+  "checks": "/www/server/panel/plugin/securityrisk",
+  "author": "mdestafadilah",
+  "home": "https://github.com/mdestafadilah"
+}

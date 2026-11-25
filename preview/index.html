@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security Risk</title>
+<style>
+:root{
+  --bg:#f4f6f8;
+  --card:#ffffff;
+  --ink:#1f2937;
+  --ink-2:#4b5563;
+  --muted:#8b95a5;
+  --line:#e6e9ef;
+  --accent:#20a53a;
+  --accent-dark:#178a2f;
+  --accent-soft:#eaf7ec;
+  --high:#e34d59;
+  --high-soft:#fdecee;
+  --medium:#e08a00;
+  --medium-soft:#fff6e5;
+  --low:#3b82f6;
+  --low-soft:#eef4ff;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 8px 24px rgba(16,24,40,.06);
+  --radius:10px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg);
+  color:var(--ink);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",
+       Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+.wrap{max-width:1040px;margin:0 auto;padding:20px 20px 40px}
+
+/* ---------- header ---------- */
+.topbar{display:flex;align-items:flex-start;gap:14px;justify-content:space-between;flex-wrap:wrap;margin-bottom:18px}
+.brand{display:flex;gap:12px;align-items:center;min-width:0}
+.logo{
+  width:44px;height:44px;flex:0 0 44px;border-radius:12px;
+  background:linear-gradient(160deg,#2bbd4d,#178a2f);
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 6px 14px rgba(32,165,58,.25);
+}
+.logo svg{width:26px;height:26px;display:block}
+h1{font-size:19px;line-height:1.2;margin:0 0 2px;font-weight:650;letter-spacing:-.2px}
+.sub{color:var(--muted);font-size:12.5px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.actions{display:flex;align-items:center;gap:10px}
+.scanned{color:var(--muted);font-size:12.5px;text-align:right;line-height:1.35}
+
+/* ---------- buttons ---------- */
+.btn{
+  appearance:none;border:1px solid transparent;border-radius:8px;
+  padding:8px 14px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;
+  transition:background .15s,border-color .15s,box-shadow .15s,transform .05s;
+  display:inline-flex;align-items:center;gap:6px;white-space:nowrap;
+}
+.btn:active{transform:translateY(1px)}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:0 2px 6px rgba(32,165,58,.28)}
+.btn-primary:hover{background:var(--accent-dark)}
+.btn-ghost{background:#fff;border-color:var(--line);color:var(--ink-2)}
+.btn-ghost:hover{border-color:#cfd6e2;color:var(--ink)}
+.btn-danger{background:var(--high);color:#fff}
+.btn-danger:hover{background:#c93c47}
+.btn[disabled]{opacity:.55;cursor:not-allowed;transform:none}
+.btn-sm{padding:5px 10px;font-size:12.5px;border-radius:7px}
+
+/* ---------- stats ---------- */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.stat{
+  background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:13px 15px;box-shadow:var(--shadow);position:relative;overflow:hidden;
+}
+.stat .k{font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.stat .v{font-size:26px;font-weight:680;line-height:1.15;margin-top:4px;letter-spacing:-.5px}
+.stat .n{font-size:12px;color:var(--muted);margin-top:2px}
+.stat.risk .v{color:var(--high)}
+.stat.ok .v{color:var(--accent)}
+.stat.fix .v{color:var(--medium)}
+.stat::after{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--line)}
+.stat.risk::after{background:var(--high)}
+.stat.ok::after{background:var(--accent)}
+.stat.fix::after{background:var(--medium)}
+
+/* ---------- toolbar ---------- */
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:4px 0 12px;flex-wrap:wrap}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{
+  border:1px solid var(--line);background:#fff;color:var(--ink-2);
+  border-radius:999px;padding:5px 12px;font-size:12.5px;font-weight:600;cursor:pointer;
+  transition:.15s;
+}
+.chip:hover{border-color:#cfd6e2}
+.chip.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.chip b{font-weight:700;opacity:.75;margin-left:4px}
+.hint{color:var(--muted);font-size:12.5px}
+
+/* ---------- cards ---------- */
+.list{display:flex;flex-direction:column;gap:10px;min-height:120px;position:relative}
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:14px 16px 14px 18px;box-shadow:var(--shadow);position:relative;
+  animation:rise .22s ease both;
+}
+@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.card::before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;border-radius:3px;background:var(--line)}
+.card[data-level="high"]::before{background:var(--high)}
+.card[data-level="medium"]::before{background:var(--medium)}
+.card[data-level="low"]::before{background:var(--low)}
+.card[data-status="ok"]::before{background:var(--accent)}
+
+.card-head{display:flex;align-items:flex-start;gap:10px}
+.card-title{font-size:14.5px;font-weight:650;margin:0;flex:1;min-width:0;line-height:1.4;word-break:break-word}
+.badges{display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
+.badge{
+  font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;
+  padding:3px 8px;border-radius:999px;white-space:nowrap;
+}
+.badge.high{background:var(--high-soft);color:var(--high)}
+.badge.medium{background:var(--medium-soft);color:var(--medium)}
+.badge.low{background:var(--low-soft);color:var(--low)}
+.badge.ok{background:var(--accent-soft);color:var(--accent-dark)}
+.badge.auto{background:#f1f3f7;color:var(--ink-2)}
+.badge.manual{background:#fff;color:var(--muted);border:1px solid var(--line)}
+
+.card-detail{color:var(--ink-2);font-size:13px;margin:6px 0 0;word-break:break-word}
+.sol{
+  margin-top:9px;background:#fafbfc;border:1px solid var(--line);border-radius:8px;
+  padding:9px 11px;font-size:12.8px;color:var(--ink-2);
+}
+.sol .lbl{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:3px}
+.rules{margin:8px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px}
+.rules li{
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.8px;
+  background:#f6f7f9;border:1px solid var(--line);border-radius:6px;padding:5px 8px;
+  color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.rules li .loc{color:var(--muted)}
+.card-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:11px}
+.card[data-status="ok"] .card-title{color:var(--ink-2);font-weight:600}
+
+/* ---------- skeleton / empty ---------- */
+.skel{background:#fff;border:1px solid var(--line);border-radius:var(--radius);height:76px;
+  position:relative;overflow:hidden}
+.skel::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.85),transparent);
+  animation:shimmer 1.1s infinite}
+@keyframes shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+.empty{background:#fff;border:1px dashed var(--line);border-radius:var(--radius);padding:34px;text-align:center;color:var(--muted)}
+
+/* ---------- history ---------- */
+.history{margin-top:22px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.history-toggle{
+  width:100%;background:none;border:0;padding:13px 16px;font:inherit;font-weight:650;
+  color:var(--ink);display:flex;align-items:center;justify-content:space-between;cursor:pointer;
+}
+.history-toggle:hover{background:#fafbfc}
+.history-toggle .chev{color:var(--muted);transition:transform .18s}
+.history-toggle.open .chev{transform:rotate(180deg)}
+.history-body{border-top:1px solid var(--line);padding:6px 0}
+.hrow{display:flex;gap:12px;align-items:flex-start;padding:10px 16px;border-bottom:1px solid #f2f4f7}
+.hrow:last-child{border-bottom:0}
+.hrow .when{color:var(--muted);font-size:12px;width:132px;flex-shrink:0}
+.hrow .what{flex:1;min-width:0}
+.hrow .what b{font-size:13px;font-weight:600;display:block}
+.hrow .what ul{margin:4px 0 0;padding-left:16px;color:var(--ink-2);font-size:12.3px}
+.hrow.fail .what b{color:var(--high)}
+.hrow .right{flex-shrink:0}
+
+/* ---------- modal ---------- */
+.overlay{
+  position:fixed;inset:0;background:rgba(17,24,39,.45);z-index:9000;
+  display:flex;align-items:center;justify-content:center;padding:20px;
+  opacity:0;pointer-events:none;transition:opacity .16s;
+}
+.overlay.show{opacity:1;pointer-events:auto}
+.modal{
+  background:#fff;border-radius:12px;width:100%;max-width:560px;max-height:86vh;
+  display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(16,24,40,.28);
+  transform:translateY(6px) scale(.99);transition:transform .18s;
+}
+.overlay.show .modal{transform:none}
+.modal-head{padding:18px 20px 0}
+.modal-head h3{margin:0;font-size:16px;font-weight:680;line-height:1.35}
+.modal-head p{margin:4px 0 0;color:var(--muted);font-size:12.5px}
+.modal-body{padding:14px 20px;overflow:auto}
+.modal-foot{padding:12px 20px 16px;display:flex;justify-content:flex-end;gap:8px;border-top:1px solid var(--line)}
+.plan{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:7px}
+.plan li{
+  display:flex;gap:9px;font-size:13px;color:var(--ink-2);
+  background:#fafbfc;border:1px solid var(--line);border-radius:8px;padding:8px 10px;
+}
+.plan li i{
+  flex:0 0 18px;height:18px;border-radius:50%;background:var(--accent-soft);color:var(--accent-dark);
+  font-style:normal;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;
+}
+.warn{
+  margin-top:12px;background:var(--high-soft);border:1px solid #f7c9ce;border-radius:8px;
+  padding:10px 12px;color:#a52a35;font-size:12.8px;display:flex;gap:8px;align-items:flex-start;
+}
+.warn b{display:block;margin-bottom:2px}
+.confirm-line{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:13px;color:var(--ink-2)}
+pre.cmd{
+  margin:0;background:#0f172a;color:#d6e2f0;border-radius:8px;padding:12px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;
+  overflow:auto;white-space:pre-wrap;word-break:break-word;line-height:1.6;
+}
+
+/* ---------- toast ---------- */
+#toasts{position:fixed;right:18px;bottom:18px;z-index:9500;display:flex;flex-direction:column;gap:8px;max-width:min(420px,90vw)}
+.toast{
+  background:#fff;border:1px solid var(--line);border-left:3px solid var(--accent);
+  border-radius:8px;box-shadow:0 10px 30px rgba(16,24,40,.16);padding:10px 13px;font-size:13px;
+  animation:slide .2s ease both;
+}
+.toast.err{border-left-color:var(--high)}
+.toast.warn{border-left-color:var(--medium)}
+.toast b{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;font-weight:700}
+@keyframes slide{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+footer{margin-top:24px;color:var(--muted);font-size:12px;text-align:center;line-height:1.7}
+footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5px}
+
+@media (max-width:760px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .hrow .when{width:auto}
+  .hrow{flex-wrap:wrap}
+  .actions{width:100%;justify-content:space-between}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 2.6 4.8 5.4v6.1c0 4.6 3 8.2 7.2 9.9 4.2-1.7 7.2-5.3 7.2-9.9V5.4L12 2.6Z"
+                fill="rgba(255,255,255,.18)" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>
+          <path d="m8.6 11.9 2.3 2.3 4.5-4.6" stroke="#fff" stroke-width="1.9"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div style="min-width:0">
+        <h1>Security Risk</h1>
+        <p class="sub" id="sysline">Reading server profile…</p>
+      </div>
+    </div>
+    <div class="actions">
+      <div class="scanned" id="scanned"></div>
+      <button class="btn btn-primary" id="btnScan" type="button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span id="scanLabel">Scan again</span>
+      </button>
+    </div>
+  </header>
+
+  <section class="stats" id="stats"></section>
+
+  <div class="toolbar">
+    <div class="chips" id="chips"></div>
+    <div class="hint" id="hint"></div>
+  </div>
+
+  <main class="list" id="list"></main>
+
+  <section class="history">
+    <button class="history-toggle" id="btnHistory" type="button">
+      <span>Fix history &amp; backups</span>
+      <span class="chev">▾</span>
+    </button>
+    <div class="history-body" id="historyBody" style="display:none"></div>
+  </section>
+
+  <footer>
+    Every fix is backed up to <code>plugin/securityrisk/data/backup</code> before it is applied
+    and is validated with <code>visudo -c</code> / <code>sshd -t</code> afterwards.
+  </footer>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+    <div class="modal-head">
+      <h3 id="mTitle">Confirm</h3>
+      <p id="mSub"></p>
+    </div>
+    <div class="modal-body" id="mBody"></div>
+    <div class="modal-foot" id="mFoot"></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+/* ---- preview shim: answers the plugin API with fixture data ---- */
+(function () {
+  var ITEMS = [
+    {id:'cli_timeout', title:'No command line timeout is configured for exit', level:'medium',
+     status:'risk', fixable:true, danger:false,
+     detail:'TMOUT is not defined in /etc/profile, /etc/profile.d/*.sh or /etc/bash.bashrc, so an idle root shell never expires.',
+     solution:'Add TMOUT=300 (readonly, exported) to /etc/profile, then re-login or run "source /etc/profile". Keep the value at 600 seconds or less.',
+     plan:['Append "TMOUT=300" + "readonly TMOUT" + "export TMOUT" to /etc/profile',
+           'Back up /etc/profile before writing',
+           'Re-run this check to confirm the value is picked up'],
+     commands:[]},
+    {id:'sudo_nopasswd', title:'The following sudo files contain the NOPASSWD flag: /etc/sudoers, /etc/sudoers.d/90-cloud-init-users',
+     level:'medium', status:'risk', fixable:true, danger:false,
+     detail:'Passwordless sudo is allowed by 3 rule(s): /etc/sudoers, /etc/sudoers.d/90-cloud-init-users',
+     solution:'Comment out or remove the NOPASSWD marker in the listed files. Sudo will then ask for the user password again. Validate with "visudo -c".',
+     plan:['Back up /etc/sudoers, /etc/sudoers.d/90-cloud-init-users',
+           'Comment out every line that contains NOPASSWD:',
+           'Validate the result with "visudo -c" and roll back if it fails',
+           '  /etc/sudoers:4  %sudo ALL=(ALL:ALL) NOPASSWD: ALL',
+           '  /etc/sudoers:5  bob ALL=(ALL) NOPASSWD: ALL, PASSWD: /bin/ls',
+           '  /etc/sudoers.d/90-cloud-init-users:1  cloud-init ALL=(ALL) NOPASSWD: ALL'],
+     commands:[],
+     rules:[{file:'/etc/sudoers', line:4, text:'%sudo ALL=(ALL:ALL) NOPASSWD: ALL'},
+            {file:'/etc/sudoers', line:5, text:'bob ALL=(ALL) NOPASSWD: ALL, \\'},
+            {file:'/etc/sudoers.d/90-cloud-init-users', line:1, text:'cloud-init ALL=(ALL) NOPASSWD: ALL'}]},
+    {id:'ssh_password_auth', title:'SSH accepts password authentication', level:'medium',
+     status:'risk', fixable:true, danger:true,
+     detail:'PasswordAuthentication yes (from /etc/ssh/sshd_config). Brute-force attacks against passwords are the most common way servers get compromised.',
+     solution:'Disable password login once every admin uses a key: "PasswordAuthentication no", then reload sshd.',
+     plan:['Back up /etc/ssh/sshd_config','Set PasswordAuthentication no',
+           'Validate with "sshd -t", reload sshd, roll back on failure',
+           'Make sure you have a working SSH key before confirming'], commands:[]},
+    {id:'ssh_root_login', title:'SSH allows direct root login', level:'medium', status:'risk',
+     fixable:true, danger:false,
+     detail:'PermitRootLogin yes (from /etc/ssh/sshd_config).',
+     solution:'Set "PermitRootLogin prohibit-password" so root can only log in with a key, then run "sshd -t" and reload sshd.',
+     plan:['Back up /etc/ssh/sshd_config','Set PermitRootLogin prohibit-password',
+           'Validate with "sshd -t", reload sshd, roll back on failure'], commands:[]},
+    {id:'firewall', title:'No host firewall is enabled', level:'medium', status:'risk',
+     fixable:false, danger:false,
+     detail:'Neither firewalld, ufw nor iptables rules were detected.',
+     solution:'Enable the firewall of your distribution and allow only the ports you actually use (SSH, panel port, HTTP/HTTPS).',
+     plan:[],
+     commands:['ufw allow 22/tcp && ufw allow 8888/tcp && ufw --force enable   # Debian/Ubuntu',
+               'firewall-cmd --permanent --add-service=ssh && firewall-cmd --reload   # RHEL/Alma/Rocky']},
+    {id:'fail2ban', title:'Fail2ban is not protecting the server', level:'medium', status:'risk',
+     fixable:false, danger:false,
+     detail:'No fail2ban jail was detected, so repeated login failures are never blocked at the IP level.',
+     solution:'Install fail2ban and enable the sshd jail. aaPanel also ships an SSH brute-force protection module you can use instead.',
+     plan:[], commands:['apt-get install -y fail2ban && systemctl enable --now fail2ban',
+                        'fail2ban-client status sshd']},
+    {id:'file_permissions', title:'Sensitive system files have safe permissions', level:'low',
+     status:'ok', fixable:false, danger:false,
+     detail:'All checked files are at or below their maximum allowed mode.',
+     solution:'No action needed.', plan:[], commands:[]},
+    {id:'empty_password', title:'No account has an empty password', level:'low', status:'ok',
+     fixable:false, danger:false,
+     detail:'Every entry in /etc/shadow has a password hash or a lock marker.',
+     solution:'No action needed.', plan:[], commands:[]},
+    {id:'panel_ssl', title:'The panel is served over HTTPS', level:'low', status:'ok',
+     fixable:false, danger:false,
+     detail:'Panel SSL marker /www/server/panel/data/ssl.pl is present.',
+     solution:'No action needed.', plan:[], commands:[]}
+  ];
+
+  var HISTORY = [
+    {time: Math.floor(Date.now()/1000) - 180, id:'sudo_nopasswd',
+     title:'The following sudo files contain the NOPASSWD flag', ok:true,
+     changes:['Commented out 3 line(s) in /etc/sudoers',
+              'Commented out 1 line(s) in /etc/sudoers.d/90-cloud-init-users'],
+     backup:'20261125-095512-sudo_nopasswd'},
+    {time: Math.floor(Date.now()/1000) - 900, id:'ssh_root_login',
+     title:'SSH allows direct root login', ok:true,
+     changes:['Set PermitRootLogin prohibit-password in /etc/ssh/sshd_config','Reloaded sshd'],
+     backup:'20261125-094102-ssh_permitrootlogin'},
+    {time: Math.floor(Date.now()/1000) - 3600, id:'cli_timeout',
+     title:'No command line timeout is configured for exit', ok:false,
+     msg:'Rolled back, validation failed: /etc/profile: permission denied',
+     changes:[], backup:''}
+  ];
+
+  function payload(method) {
+    if (method === 'get_history') return {status:true, items: HISTORY};
+    if (method === 'fix') {
+      var copy = JSON.parse(JSON.stringify(ITEMS[0]));
+      copy.status = 'ok'; copy.title = 'Command line timeout is configured';
+      copy.detail = 'TMOUT=300 (at /etc/profile:31).'; copy.fixable = false; copy.plan = [];
+      return {status:true, msg:'Applied 1 change(s).', item: copy,
+              changes:['Appended TMOUT=300 block to /etc/profile'],
+              backup:'20261125-100001-cli_timeout'};
+    }
+    if (method === 'restore') return {status:true, msg:'Restored 1 file(s).'};
+    return {
+      status:true, items: ITEMS, scan_time: Math.floor(Date.now()/1000),
+      summary:{total:9, risk:6, ok:3, unknown:0, fixable:4, high:0, medium:6, low:0},
+      system:{hostname:'srv-jkt-01', os:'Ubuntu 22.04.4 LTS', kernel:'5.15.0-119-generic'},
+      last_fix: HISTORY[0]
+    };
+  }
+
+  window.fetch = function (url) {
+    var m = /s=([a-z_]+)/.exec(url || '');
+    var body = JSON.stringify(payload(m ? m[1] : 'get_index'));
+    return new Promise(function (resolve) {
+      setTimeout(function () {
+        resolve({ok: true, status: 200, text: function () { return Promise.resolve(body); }});
+      }, 260);
+    });
+  };
+})();
+</script>
+
+
+<script>
+(function () {
+  'use strict';
+
+  var API = '/plugin?action=a&name=securityrisk&s=';
+  var STATE = { items: [], summary: {}, system: {}, filter: 'all', busy: false, scanTime: 0 };
+  var LEVEL_TEXT = { high: 'High risk', medium: 'Medium risk', low: 'Low risk', ok: 'Passed' };
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function pad(n) { return n < 10 ? '0' + n : '' + n; }
+
+  function fmtTime(ts) {
+    if (!ts) return '';
+    var d = new Date(ts * 1000);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+           ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  function ago(ts) {
+    if (!ts) return '';
+    var s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+    if (s < 60) return 'just now';
+    if (s < 3600) return Math.floor(s / 60) + ' min ago';
+    if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+    return Math.floor(s / 86400) + ' d ago';
+  }
+
+  function req(method, data) {
+    var body = new URLSearchParams();
+    Object.keys(data || {}).forEach(function (k) { body.append(k, data[k]); });
+    return fetch(API + method, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      body: body.toString()
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    }).then(function (text) {
+      try { return JSON.parse(text); }
+      catch (e) {
+        var t = (text || '').replace(/<[^>]+>/g, ' ').trim();
+        throw new Error(t.slice(0, 160) || 'Empty response');
+      }
+    });
+  }
+
+  function toast(title, msg, kind) {
+    var el = document.createElement('div');
+    el.className = 'toast' + (kind ? ' ' + kind : '');
+    el.innerHTML = '<b>' + esc(title) + '</b>' + esc(msg);
+    $('toasts').appendChild(el);
+    setTimeout(function () {
+      el.style.transition = 'opacity .25s';
+      el.style.opacity = '0';
+      setTimeout(function () { el.remove(); }, 260);
+    }, kind === 'err' ? 7000 : 4200);
+  }
+
+  /* ---------------- render ---------------- */
+
+  function renderHeader() {
+    var s = STATE.system || {};
+    var bits = [];
+    if (s.hostname) bits.push(s.hostname);
+    if (s.os) bits.push(s.os);
+    if (s.kernel) bits.push('kernel ' + s.kernel);
+    $('sysline').textContent = bits.length ? bits.join(' · ') : 'Server security audit';
+    $('scanned').innerHTML = STATE.scanTime
+      ? 'Last scan<br><b>' + esc(ago(STATE.scanTime)) + '</b>'
+      : '';
+  }
+
+  function renderStats() {
+    var s = STATE.summary || {};
+    var cards = [
+      { k: 'Checks run', v: s.total || 0, n: 'live server state', cls: '' },
+      { k: 'Risks found', v: s.risk || 0, n: (s.high || 0) + ' high · ' + (s.medium || 0) + ' medium · ' + (s.low || 0) + ' low', cls: 'risk' },
+      { k: 'One-click fixes', v: s.fixable || 0, n: 'available right now', cls: 'fix' },
+      { k: 'Passed', v: s.ok || 0, n: 'no action needed', cls: 'ok' }
+    ];
+    $('stats').innerHTML = cards.map(function (c) {
+      return '<div class="stat ' + c.cls + '"><div class="k">' + c.k + '</div>' +
+             '<div class="v">' + c.v + '</div><div class="n">' + esc(c.n) + '</div></div>';
+    }).join('');
+  }
+
+  function counts() {
+    var c = { all: STATE.items.length, risk: 0, fix: 0, ok: 0 };
+    STATE.items.forEach(function (i) {
+      if (i.status === 'risk') c.risk++;
+      if (i.status === 'risk' && i.fixable) c.fix++;
+      if (i.status === 'ok') c.ok++;
+    });
+    return c;
+  }
+
+  function renderChips() {
+    var c = counts();
+    var defs = [
+      ['all', 'All', c.all], ['risk', 'Risks', c.risk],
+      ['fix', 'Auto-fixable', c.fix], ['ok', 'Passed', c.ok]
+    ];
+    $('chips').innerHTML = defs.map(function (d) {
+      return '<button type="button" class="chip' + (STATE.filter === d[0] ? ' on' : '') +
+             '" data-f="' + d[0] + '">' + d[1] + '<b>' + d[2] + '</b></button>';
+    }).join('');
+    var risk = STATE.summary.risk || 0;
+    $('hint').textContent = risk
+      ? risk + ' item(s) need attention'
+      : 'Everything checked is in good shape';
+  }
+
+  function visible() {
+    return STATE.items.filter(function (i) {
+      if (STATE.filter === 'risk') return i.status === 'risk';
+      if (STATE.filter === 'fix') return i.status === 'risk' && i.fixable;
+      if (STATE.filter === 'ok') return i.status === 'ok';
+      return true;
+    });
+  }
+
+  function cardHtml(item) {
+    var level = item.status === 'ok' ? 'ok' : (item.level || 'low');
+    var badge = '<span class="badge ' + level + '">' +
+                esc(item.status === 'ok' ? 'Passed' : (LEVEL_TEXT[item.level] || item.level)) +
+                '</span>';
+    var mode = item.status === 'risk'
+      ? '<span class="badge ' + (item.fixable ? 'auto' : 'manual') + '">' +
+        (item.fixable ? 'Auto-fix' : 'Manual') + '</span>' +
+        (item.danger ? '<span class="badge high">lockout risk</span>' : '')
+      : '';
+
+    var rules = '';
+    if (item.rules && item.rules.length) {
+      rules = '<ul class="rules">' + item.rules.slice(0, 4).map(function (r) {
+        return '<li><span class="loc">' + esc(r.file) + ':' + esc(r.line) + '</span>  ' +
+               esc(r.text) + '</li>';
+      }).join('') + '</ul>';
+    }
+
+    var sol = (item.solution && item.status !== 'ok')
+      ? '<div class="sol"><span class="lbl">Solution</span>' + esc(item.solution) + '</div>'
+      : '';
+
+    var foot = '';
+    if (item.status === 'risk') {
+      if (item.fixable) {
+        foot = '<button type="button" class="btn ' + (item.danger ? 'btn-danger' : 'btn-primary') +
+               ' btn-sm" data-fix="' + esc(item.id) + '">Resolve</button>';
+      } else if (item.commands && item.commands.length) {
+        foot = '<button type="button" class="btn btn-ghost btn-sm" data-cmd="' + esc(item.id) + '">' +
+               'Show commands</button>';
+      }
+    }
+
+    return '<article class="card" data-level="' + esc(level) + '" data-status="' + esc(item.status) + '">' +
+      '<div class="card-head">' +
+        '<h2 class="card-title">' + esc(item.title) + '</h2>' +
+        '<div class="badges">' + badge + mode + '</div>' +
+      '</div>' +
+      '<p class="card-detail">' + esc(item.detail) + '</p>' +
+      rules + sol +
+      (foot ? '<div class="card-foot">' + foot + '</div>' : '') +
+    '</article>';
+  }
+
+  function renderList() {
+    var list = $('list');
+    if (STATE.busy && !STATE.items.length) {
+      list.innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+      return;
+    }
+    var items = visible();
+    if (!items.length) {
+      list.innerHTML = '<div class="empty">Nothing in this filter. Run a new scan to refresh the server state.</div>';
+      return;
+    }
+    list.innerHTML = items.map(cardHtml).join('');
+  }
+
+  function render() {
+    renderHeader();
+    renderStats();
+    renderChips();
+    renderList();
+  }
+
+  /* ---------------- actions ---------------- */
+
+  function scan() {
+    if (STATE.busy) return;
+    STATE.busy = true;
+    $('btnScan').disabled = true;
+    $('scanLabel').textContent = 'Scanning…';
+    renderList();
+    req('get_index', {}).then(function (res) {
+      if (!res || res.status === false) throw new Error((res && res.msg) || 'Scan failed');
+      STATE.items = res.items || [];
+      STATE.summary = res.summary || {};
+      STATE.system = res.system || {};
+      STATE.scanTime = res.scan_time || Math.floor(Date.now() / 1000);
+      render();
+      if ($('historyBody').style.display !== 'none') loadHistory();
+    }).catch(function (err) {
+      toast('Scan failed', err.message, 'err');
+      if (!STATE.items.length) {
+        $('list').innerHTML = '<div class="empty">Could not reach the plugin backend.<br>' +
+          esc(err.message) + '</div>';
+      }
+    }).then(function () {
+      STATE.busy = false;
+      $('btnScan').disabled = false;
+      $('scanLabel').textContent = 'Scan again';
+    });
+  }
+
+  function closeModal() { $('overlay').classList.remove('show'); }
+
+  function openModal(opts) {
+    $('mTitle').textContent = opts.title;
+    $('mSub').textContent = opts.sub || '';
+    $('mBody').innerHTML = opts.body || '';
+    $('mFoot').innerHTML = opts.foot || '';
+    $('overlay').classList.add('show');
+    if (opts.onReady) opts.onReady();
+  }
+
+  function fixItem(id) {
+    var item = STATE.items.filter(function (i) { return i.id === id; })[0];
+    if (!item) return;
+
+    var plan = (item.plan || []).map(function (p, i) {
+      return '<li><i>' + (i + 1) + '</i><span>' + esc(p) + '</span></li>';
+    }).join('');
+
+    var warn = item.danger
+      ? '<div class="warn"><span>▲</span><div><b>This can lock you out</b>' +
+        'Password logins will be refused. Make sure your SSH key already works in a second ' +
+        'session before you confirm. The change is validated and rolled back if sshd rejects it.</div></div>' +
+        '<label class="confirm-line"><input type="checkbox" id="dangerOk"> ' +
+        'I have tested key-based login in another session</label>'
+      : '';
+
+    openModal({
+      title: 'Resolve: ' + item.title,
+      sub: 'The current file(s) are backed up first, then the change is applied and verified.',
+      body: (plan ? '<ul class="plan">' + plan + '</ul>' : '') + warn,
+      foot: '<button type="button" class="btn btn-ghost" data-close="1">Cancel</button>' +
+            '<button type="button" class="btn ' + (item.danger ? 'btn-danger' : 'btn-primary') +
+            '" id="mApply">Apply fix</button>',
+      onReady: function () {
+        $('mApply').onclick = function () {
+          if (item.danger) {
+            var cb = $('dangerOk');
+            if (cb && !cb.checked) {
+              toast('Confirmation needed', 'Tick the checkbox after testing key login.', 'warn');
+              return;
+            }
+          }
+          applyFix(id);
+        };
+      }
+    });
+  }
+
+  function applyFix(id) {
+    var btn = $('mApply');
+    if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
+    req('fix', { id: id }).then(function (res) {
+      if (!res || res.status === false) {
+        toast('Fix failed', (res && res.msg) || 'Unknown error', 'err');
+        closeModal();
+        return;
+      }
+      toast('Resolved', (res.changes && res.changes[0]) || res.msg);
+      closeModal();
+      // refresh just this item, keep the rest of the list stable
+      var idx = -1;
+      STATE.items.forEach(function (it, i) { if (it.id === id) idx = i; });
+      if (idx >= 0 && res.item) STATE.items[idx] = res.item;
+      recomputeSummary();
+      render();
+      if ($('historyBody').style.display !== 'none') loadHistory();
+    }).catch(function (err) {
+      toast('Fix failed', err.message, 'err');
+      closeModal();
+    });
+  }
+
+  function recomputeSummary() {
+    var s = { total: STATE.items.length, risk: 0, ok: 0, unknown: 0, fixable: 0, high: 0, medium: 0, low: 0 };
+    STATE.items.forEach(function (i) {
+      if (i.status === 'risk') {
+        s.risk++;
+        s[i.level] = (s[i.level] || 0) + 1;
+        if (i.fixable) s.fixable++;
+      } else if (i.status === 'ok') s.ok++;
+      else s.unknown++;
+    });
+    STATE.summary = s;
+  }
+
+  function showCommands(id) {
+    var item = STATE.items.filter(function (i) { return i.id === id; })[0];
+    if (!item) return;
+    var text = (item.commands || []).join('\n');
+    openModal({
+      title: item.title,
+      sub: 'Run these on the server as root. This plugin does not run them for you.',
+      body: '<pre class="cmd">' + esc(text) + '</pre>',
+      foot: '<button type="button" class="btn btn-ghost" data-close="1">Close</button>' +
+            '<button type="button" class="btn btn-primary" id="mCopy">Copy</button>',
+      onReady: function () {
+        $('mCopy').onclick = function () {
+          var done = function () { toast('Copied', 'Commands copied to clipboard.'); };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done, fallback);
+          } else { fallback(); }
+          function fallback() {
+            var ta = document.createElement('textarea');
+            ta.value = text; document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); done(); } catch (e) { toast('Copy failed', 'Select the text manually.', 'err'); }
+            ta.remove();
+          }
+        };
+      }
+    });
+  }
+
+  /* ---------------- history ---------------- */
+
+  function loadHistory() {
+    var box = $('historyBody');
+    box.innerHTML = '<div class="hrow"><div class="what" style="color:#8b95a5">Loading…</div></div>';
+    req('get_history', {}).then(function (res) {
+      var items = (res && res.items) || [];
+      if (!items.length) {
+        box.innerHTML = '<div class="hrow"><div class="what" style="color:#8b95a5">' +
+          'No fix has been applied yet. Every applied fix and its backup shows up here.</div></div>';
+        return;
+      }
+      box.innerHTML = items.map(function (h) {
+        var changes = (h.changes || []).map(function (c) { return '<li>' + esc(c) + '</li>'; }).join('');
+        var restore = (h.ok && h.backup)
+          ? '<button type="button" class="btn btn-ghost btn-sm" data-restore="' + esc(h.backup) + '">Restore</button>'
+          : '';
+        return '<div class="hrow' + (h.ok ? '' : ' fail') + '">' +
+          '<div class="when">' + esc(fmtTime(h.time)) + '</div>' +
+          '<div class="what"><b>' + esc(h.title || h.id) + '</b>' +
+          (changes ? '<ul>' + changes + '</ul>' : '') +
+          (h.msg && !h.ok ? '<div style="color:#a52a35;font-size:12.3px;margin-top:3px">' + esc(h.msg) + '</div>' : '') +
+          '</div><div class="right">' + restore + '</div></div>';
+      }).join('');
+    }).catch(function (err) {
+      box.innerHTML = '<div class="hrow"><div class="what" style="color:#a52a35">' +
+        esc(err.message) + '</div></div>';
+    });
+  }
+
+  function restore(bid) {
+    openModal({
+      title: 'Restore backup',
+      sub: 'Files from this backup will be written back and the plugin will rescan.',
+      body: '<ul class="plan"><li><i>1</i><span>Copy the saved file(s) back to their original path</span></li>' +
+            '<li><i>2</i><span>Restore the original file mode</span></li>' +
+            '<li><i>3</i><span>Re-run the security scan</span></li></ul>' +
+            '<div class="warn"><span>▲</span><div><b>Check the service afterwards</b>' +
+            'If you restore sudoers or sshd_config, run <code>visudo -c</code> and <code>sshd -t</code>.</div></div>',
+      foot: '<button type="button" class="btn btn-ghost" data-close="1">Cancel</button>' +
+            '<button type="button" class="btn btn-primary" id="mApply">Restore</button>',
+      onReady: function () {
+        $('mApply').onclick = function () {
+          this.disabled = true; this.textContent = 'Restoring…';
+          req('restore', { backup: bid }).then(function (res) {
+            if (!res || res.status === false) throw new Error((res && res.msg) || 'Restore failed');
+            toast('Restored', res.msg || 'Backup applied.');
+            closeModal();
+            scan();
+          }).catch(function (err) {
+            toast('Restore failed', err.message, 'err');
+            closeModal();
+          });
+        };
+      }
+    });
+  }
+
+  /* ---------------- wiring ---------------- */
+
+  document.addEventListener('click', function (e) {
+    var t = e.target.closest ? e.target.closest('[data-fix],[data-cmd],[data-close],[data-restore],[data-f]') : null;
+    if (!t) {
+      if (e.target === $('overlay')) closeModal();
+      return;
+    }
+    if (t.hasAttribute('data-fix')) { fixItem(t.getAttribute('data-fix')); return; }
+    if (t.hasAttribute('data-cmd')) { showCommands(t.getAttribute('data-cmd')); return; }
+    if (t.hasAttribute('data-restore')) { restore(t.getAttribute('data-restore')); return; }
+    if (t.hasAttribute('data-close')) { closeModal(); return; }
+    if (t.hasAttribute('data-f')) {
+      STATE.filter = t.getAttribute('data-f');
+      renderChips();
+      renderList();
+    }
+  });
+
+  $('btnScan').addEventListener('click', scan);
+
+  $('btnHistory').addEventListener('click', function () {
+    var box = $('historyBody');
+    var open = box.style.display === 'none';
+    box.style.display = open ? 'block' : 'none';
+    this.classList.toggle('open', open);
+    if (open) loadHistory();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeModal();
+  });
+
+  scan();
+  setInterval(function () { if (STATE.scanTime) renderHeader(); }, 30000);
+})();
+</script>
+</body>
+</html>
