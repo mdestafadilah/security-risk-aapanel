@@ -21,6 +21,11 @@ used: it returns (stdout, stderr) without the exit code, which would make
 every validator look successful.
 
 The class name must match the file name (aaPanel plugin contract).
+
+DISCLAIMER: provided "as is", without warranty of any kind. It modifies system
+files as root; use it at your own risk. The repository owner and contributors
+are not liable for any lockout, downtime, data loss or other damage arising
+from its use. See README.md ("Disclaimer & risiko penggunaan").
 """
 
 import io

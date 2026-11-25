@@ -5,6 +5,11 @@ daftar temuan (seperti **"No command line timeout is configured for exit"** dan
 **"sudo files contain the NOPASSWD flag"**), lalu menyediakan tombol **Resolve**
 untuk memperbaikinya langsung dari panel.
 
+> **⚠️ Disclaimer:** plugin ini mengubah konfigurasi sistem (`/etc/sudoers`,
+> `sshd_config`, `/etc/profile`, permission file, dan status akun) dengan hak
+> root. Penggunaan sepenuhnya menjadi **risiko Anda sendiri**. Baca bagian
+> [Disclaimer & risiko penggunaan](#disclaimer--risiko-penggunaan) sebelum memasang.
+
 Dokumentasi plugin yang dipakai sebagai acuan: `aaPanel Linux Panel Plug-in
 development documentation v1.1` (struktur file, `info.json`, kelas
 `<nama>_main`, route `/plugin?action=a&name=<nama>&s=<method>`, dan `public`).
@@ -190,6 +195,45 @@ fixture distro:
 | Ubuntu 22.04 | family `debian`, `apt-get`, `ufw`, unit `ssh`, `%sudo`, AppArmor aktif, perintah firewall memakai port panel 8888 |
 | Rocky Linux 9.4 | family `rhel`, `dnf`, `firewalld`, unit `sshd`, `%wheel`, SELinux *enforcing* = ok, fail2ban lewat EPEL, port panel 12345 |
 | tanpa os-release | fallback `Generic Linux`, tanpa cek SELinux/AppArmor, saran `iptables` |
+
+## Disclaimer & risiko penggunaan
+
+Plugin ini disediakan **"sebagaimana adanya" (*as is*)**, tanpa jaminan apa pun,
+baik tersurat maupun tersirat, termasuk jaminan bahwa plugin bebas dari bug,
+cocok untuk keperluan tertentu, atau aman untuk setiap konfigurasi server.
+
+Dengan memasang dan memakai plugin ini, Anda memahami dan menyetujui bahwa:
+
+- **Segala risiko penggunaan berada di luar tanggung jawab pemilik repo**
+  maupun kontributornya. Pemilik repo tidak bertanggung jawab atas kerugian
+  langsung maupun tidak langsung, termasuk server tidak bisa diakses
+  (terkunci dari SSH/sudo), layanan berhenti, kehilangan data, gangguan
+  operasional, pelanggaran keamanan, atau kerugian finansial yang timbul dari
+  pemakaian, salah pakai, maupun ketidakmampuan memakai plugin ini.
+- Plugin berjalan dengan **hak root** dan dapat mengubah `/etc/sudoers`,
+  `/etc/sudoers.d/*`, `/etc/ssh/sshd_config` (+ `sshd_config.d`), `/etc/profile`,
+  permission/owner file sistem, serta mengunci akun. Perubahan seperti
+  `PasswordAuthentication no` atau penghapusan `NOPASSWD` **dapat mengunci Anda**
+  dari server bila tidak disiapkan dengan benar.
+- Backup, validasi (`visudo`, `sshd -t`), dan rollback adalah lapisan pengaman,
+  **bukan jaminan**. Kondisi tertentu (distro/versi yang tidak teruji,
+  konfigurasi kustom, panel yang dimodifikasi, kegagalan disk) tetap bisa
+  menyebabkan hasil yang tidak diharapkan.
+- Hasil scan bersifat **indikatif**, bukan audit keamanan menyeluruh. Status
+  "ok" tidak berarti server aman dari semua ancaman.
+- Plugin ini **bukan** produk resmi aaPanel dan tidak berafiliasi dengan
+  pengembang aaPanel.
+
+Sebelum menekan **Resolve** di server produksi, disarankan untuk:
+
+1. Mencoba lebih dulu di server uji / snapshot VM.
+2. Membuat snapshot atau backup server di luar plugin ini.
+3. Menyiapkan akses darurat (konsol VPS/KVM, sesi SSH kedua yang tetap terbuka,
+   SSH key yang sudah diuji).
+4. Membaca rencana perubahan (*plan*) di dialog konfirmasi sebelum menyetujuinya.
+
+Jika Anda tidak setuju dengan ketentuan di atas, jangan pasang atau pakai
+plugin ini.
 
 ## Catatan
 

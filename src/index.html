@@ -285,7 +285,11 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
 
   <footer>
     Every fix is backed up to <code>plugin/securityrisk/data/backup</code> before it is applied
-    and is validated with <code>visudo -c</code> / <code>sshd -t</code> afterwards.
+    and is validated with <code>visudo -c</code> / <code>sshd -t</code> afterwards.<br>
+    <b>Disclaimer:</b> this plugin changes system files as root and is provided "as is",
+    without warranty. You use it at your own risk; the repository owner is not liable
+    for lockouts, downtime, data loss or any other damage. Test on a non-production
+    server and keep console access before applying fixes.
   </footer>
 </div>
 
