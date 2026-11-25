@@ -50,6 +50,28 @@ def write(root, rel, body, mode=0o644):
     return path
 
 
+def leftovers(root):
+    out = []
+    for base, _dirs, files in os.walk(root):
+        out += [os.path.join(base, f) for f in files if '.secrisk-' in f]
+    return out
+
+
+class FakeRunner(object):
+    """Stands in for subprocess: rules map a binary name to (out, ok) or a callable."""
+
+    def __init__(self, **rules):
+        self.rules = rules
+        self.calls = []
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        rule = self.rules.get(os.path.basename(args[0]).replace('-', '_'))
+        if rule is None:
+            return '', False  # binary not installed
+        return rule(args) if callable(rule) else rule
+
+
 def read(root, rel):
     path = os.path.join(root, rel.replace('/', os.sep))
     with io.open(path, 'r', encoding='utf-8', errors='replace') as f:
@@ -80,17 +102,25 @@ def build_fixture(root):
         '\tPASSWD: /bin/ls\n'
         '#includedir /etc/sudoers.d\n'
     ), 0o440)
+    # cloud images: the admin user has no password, only NOPASSWD sudo
     write(root, 'etc/sudoers.d/90-cloud-init-users',
-          'cloud-init ALL=(ALL) NOPASSWD: ALL\n', 0o440)
+          'ubuntu ALL=(ALL) NOPASSWD: ALL\n', 0o440)
     write(root, 'etc/passwd', (
         'root:x:0:0:root:/root:/bin/bash\n'
         'testuser:x:1000:1000::/home/testuser:/bin/bash\n'
+        'bob:x:1001:1001::/home/bob:/bin/bash\n'
+        'ubuntu:x:1002:1002::/home/ubuntu:/bin/bash\n'
     ))
-    write(root, 'etc/group', 'root:x:0:\ntestuser:x:1000:\n')
+    write(root, 'etc/group', (
+        'root:x:0:\nshadow:x:42:\nsudo:x:27:bob\n'
+        'testuser:x:1000:\nbob:x:1001:\nubuntu:x:1002:\n'
+    ))
     write(root, 'etc/gshadow', 'root:*::\n')
     write(root, 'etc/shadow', (
         'root:$6$abcdefgh$hash:19000:0:99999:7:::\n'
         'testuser::19000:0:99999:7:::\n'
+        'bob:$6$bobsalt$hash:19000:0:99999:7:::\n'
+        'ubuntu:!:19000:0:99999:7:::\n'
     ), 0o600)
     write(root, 'etc/ssh/sshd_config', (
         '# sshd_config\n'
@@ -139,6 +169,173 @@ def load_module(root, data_dir):
     return mod
 
 
+def validators_and_exit_codes():
+    """The validators must decide on the real exit code (the panel's ExecShell
+    never reports one, which used to make every check look successful)."""
+    print('\n13. validators, exit codes and rollback')
+    root = tempfile.mkdtemp(prefix='secrisk-run-')
+    data = tempfile.mkdtemp(prefix='secrisk-rundata-')
+    build_fixture(root)
+    mod = load_module(root, data)
+    mod.PERM_RULES = []
+    app = mod.securityrisk_main()
+    main_sudoers = mod._path('/etc/sudoers')
+
+    # sshd -t rejects the staged file: the real config is never touched
+    ssh_before = read(root, 'etc/ssh/sshd_config')
+    mod._RUNNER = FakeRunner(sshd=lambda a: ('line 3: Bad configuration option', False))
+    out = app.fix({'id': 'ssh_root_login'})
+    check('sshd -t failure is a failure', out.get('status') is False, json.dumps(out)[:200])
+    check('message says nothing changed', 'nothing was changed' in out.get('msg', ''),
+          out.get('msg'))
+    check('sshd_config byte for byte unchanged', read(root, 'etc/ssh/sshd_config') == ssh_before)
+    check('no temp file left after rejection', not leftovers(root), str(leftovers(root)))
+
+    # validation passes: staged file checked first, full config next, reload last
+    runner = FakeRunner(sshd=lambda a: ('', '-T' not in a), systemctl=('', True))
+    mod._RUNNER = runner
+    out = app.fix({'id': 'ssh_root_login'})
+    check('valid sshd change applied', out.get('status') is True, json.dumps(out)[:200])
+    order = [' '.join(c[:2]) for c in runner.calls if c[0] in ('sshd', 'systemctl')]
+    check('order: sshd -t -f tmp, sshd -t, reload',
+          order.index('sshd -t') < order.index('systemctl reload')
+          and any(c[:3] == ['sshd', '-t', '-f'] and '.secrisk-' in c[3] for c in runner.calls),
+          str(order))
+    check('reload reported', 'Reloaded ssh' in out.get('changes', []), str(out.get('changes')))
+
+    # sudoers: staged file rejected -> nothing written
+    sudo_before = read(root, 'etc/sudoers')
+    mod._RUNNER = FakeRunner(visudo=('>>> sudoers.tmp: syntax error near line 4 <<<', False))
+    out = app.fix({'id': 'sudo_nopasswd'})
+    check('visudo failure is a failure', out.get('status') is False)
+    check('sudoers unchanged after staged rejection', read(root, 'etc/sudoers') == sudo_before)
+
+    # staged file fine, full policy rejected -> rolled back
+    mod._RUNNER = FakeRunner(visudo=lambda a: ('', a[-1] != main_sudoers))
+    out = app.fix({'id': 'sudo_nopasswd'})
+    check('full policy failure rolls back', out.get('status') is False
+          and 'Rolled back' in out.get('msg', ''), out.get('msg'))
+    check('sudoers restored after rollback', read(root, 'etc/sudoers') == sudo_before)
+    check('no temp file left after rollback', not leftovers(root), str(leftovers(root)))
+
+    # passwd -l: a failing exit code and a "success" that changed nothing both fail
+    mod._RUNNER = FakeRunner(passwd=('passwd: Authentication token manipulation error', False))
+    out = app.fix({'id': 'empty_password'})
+    check('passwd -l failure reported', out.get('status') is False
+          and 'testuser' in out.get('msg', ''), out.get('msg'))
+    mod._RUNNER = FakeRunner(passwd=('', True))
+    out = app.fix({'id': 'empty_password'})
+    check('passwd -l without effect is not trusted', out.get('status') is False
+          and 'Still without a password' in out.get('msg', ''), out.get('msg'))
+
+    def really_lock(args):
+        path = os.path.join(root, 'etc', 'shadow')
+        body = io.open(path, encoding='utf-8').read()
+        io.open(path, 'w', encoding='utf-8', newline='\n').write(
+            body.replace('%s::' % args[-1], '%s:!:' % args[-1]))
+        return 'passwd: password expiry information changed.', True
+    mod._RUNNER = FakeRunner(passwd=really_lock)
+    out = app.fix({'id': 'empty_password'})
+    check('passwd -l that locks succeeds', out.get('status') is True, out.get('msg'))
+
+    # status checks read the exit code / the exact answer
+    mod._RUNNER = FakeRunner(aa_status=('', False))
+    check('aa-status failure is not "enabled"', mod.check_apparmor()['status'] == 'risk')
+    mod._RUNNER = FakeRunner()
+    check('missing aa-status is not "enabled"', mod.check_apparmor()['status'] == 'risk')
+    mod._RUNNER = FakeRunner(aa_status=('', True))
+    check('aa-status exit 0 is enabled', mod.check_apparmor()['status'] == 'ok')
+    mod._RUNNER = FakeRunner(firewall_cmd=('not running', False))
+    check('"not running" firewalld is not active', mod.check_firewall()['status'] == 'risk')
+    mod._RUNNER = FakeRunner(firewall_cmd=('running', True))
+    check('running firewalld is active', mod.check_firewall()['status'] == 'ok')
+
+    # the real runner: exit status and timeout
+    mod._RUNNER, saved_root = None, mod.SYSROOT
+    mod.SYSROOT = ''
+    try:
+        _o, ok = mod._run([sys.executable, '-c', 'import sys; sys.exit(3)'])
+        check('real exit code 3 -> ok False', ok is False)
+        o, ok = mod._run([sys.executable, '-c', 'print("hi")'])
+        check('real exit code 0 -> ok True', ok is True and 'hi' in o)
+        o, ok = mod._run([sys.executable, '-c', 'import time; time.sleep(5)'], timeout=1)
+        check('hanging command times out', ok is False and 'timed out' in o, o)
+        o, ok = mod._run(['/nonexistent/secrisk-binary'])
+        check('missing binary -> ok False', ok is False)
+    finally:
+        mod.SYSROOT = saved_root
+
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(data, ignore_errors=True)
+
+
+def restore_safety():
+    print('\n14. restore safety and access guards')
+    root = tempfile.mkdtemp(prefix='secrisk-rst-')
+    data = tempfile.mkdtemp(prefix='secrisk-rstdata-')
+    build_fixture(root)
+    mod = load_module(root, data)
+    mod.PERM_RULES = []
+    app = mod.securityrisk_main()
+
+    original = read(root, 'etc/profile')
+    bid = app.fix({'id': 'cli_timeout'})['backup']
+    write(root, 'etc/profile', read(root, 'etc/profile') + 'alias ll="ls -l"\n')
+    out = app.restore({'backup': bid})
+    check('restore refuses to undo a later edit', out.get('status') is False
+          and out.get('drift') == ['/etc/profile'], json.dumps(out)[:200])
+    check('later edit still there', 'alias ll' in read(root, 'etc/profile'))
+    out = app.restore({'backup': bid, 'force': '1'})
+    check('force=1 restores anyway', out.get('status') is True
+          and read(root, 'etc/profile') == original, json.dumps(out)[:200])
+
+    mod._RUNNER = FakeRunner(visudo=('', True))
+    sbid = app.fix({'id': 'sudo_nopasswd'})['backup']
+    after_fix = read(root, 'etc/sudoers')
+    mod._RUNNER = FakeRunner(visudo=('syntax error', False))
+    out = app.restore({'backup': sbid})
+    check('restore validates sudoers first', out.get('status') is False
+          and 'Nothing was restored' in out.get('msg', ''), out.get('msg'))
+    check('sudoers untouched by rejected restore', read(root, 'etc/sudoers') == after_fix)
+    mod._RUNNER = FakeRunner(visudo=('', True))
+    out = app.restore({'backup': sbid})
+    check('validated sudoers restore works', out.get('status') is True
+          and 'NOPASSWD' in read(root, 'etc/sudoers'), json.dumps(out)[:200])
+    mod._RUNNER = None
+
+    # backups made by v1.1 held a full copy of /etc/shadow
+    legacy = os.path.join(data, 'backup', '20200101-000000-empty_password')
+    write(legacy, 'etc/shadow', 'root:$6$old$hash:::::::\n', 0o600)
+    write(legacy, 'manifest.json', json.dumps({
+        'id': '20200101-000000-empty_password', 'risk': 'empty_password',
+        'files': [{'path': '/etc/shadow', 'file': os.path.join('etc', 'shadow'), 'mode': 384}],
+        'modes': []}))
+    app.get_index({})
+    check('legacy shadow copy deleted', not os.path.exists(os.path.join(legacy, 'etc', 'shadow')))
+    check('legacy manifest cleaned',
+          json.load(io.open(os.path.join(legacy, 'manifest.json'))).get('files') == [])
+
+    evil = os.path.join(data, 'backup', '20200101-000001-cli_timeout')
+    write(evil, 'manifest.json', json.dumps({
+        'id': '20200101-000001-cli_timeout', 'risk': 'cli_timeout',
+        'files': [{'path': '/root/.ssh/authorized_keys', 'file': '../../../x'},
+                  {'path': '/etc/../root/x', 'file': 'x'}], 'modes': []}))
+    out = app.restore({'backup': '20200101-000001-cli_timeout', 'force': '1'})
+    check('tampered manifest writes nothing', out.get('status') is False, json.dumps(out))
+
+    os.environ['SECRISK_ALLOW_ANON'] = '1'
+    try:
+        check('debug anon switch works in a test sysroot', app._check({}) is True)
+        saved_root, mod.SYSROOT = mod.SYSROOT, ''
+        check('debug anon switch ignored on a real host', app._check({}) is False)
+        mod.SYSROOT = saved_root
+    finally:
+        os.environ.pop('SECRISK_ALLOW_ANON', None)
+
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(data, ignore_errors=True)
+
+
 def main():
     root = tempfile.mkdtemp(prefix='secrisk-root-')
     data = tempfile.mkdtemp(prefix='secrisk-data-')
@@ -185,27 +382,47 @@ def main():
           os.path.isfile(backup_file) and io.open(backup_file, encoding='utf-8').read() == original_profile)
 
     print('\n3. fix sudo_nopasswd')
+    plan = '\n'.join(items['sudo_nopasswd']['plan'])
+    check('plan says the ubuntu rule is skipped',
+          'skip' in plan and 'no usable password for ubuntu' in plan, plan)
+    original_dropin = read(root, 'etc/sudoers.d/90-cloud-init-users')
     out = app.fix({'id': 'sudo_nopasswd'})
     check('fix returned success', out.get('status') is True, json.dumps(out)[:300])
     sudoers = read(root, 'etc/sudoers')
     dropin = read(root, 'etc/sudoers.d/90-cloud-init-users')
-    active = [l for l in sudoers.splitlines()
-              if 'NOPASSWD' in l and not l.lstrip().startswith('#')]
-    check('no active NOPASSWD left in /etc/sudoers', not active, str(active))
-    check('continuation line commented too',
-          all(l.lstrip().startswith('#') for l in sudoers.splitlines()
-              if 'NOPASSWD' in l or 'PASSWD: /bin/ls' in l))
-    check('drop-in NOPASSWD commented',
-          all(l.lstrip().startswith('#') for l in dropin.splitlines() if 'NOPASSWD' in l))
+    check('no NOPASSWD left in /etc/sudoers', 'NOPASSWD' not in sudoers, sudoers)
+    check('group rule kept, only the tag removed', '%sudo\tALL=(ALL:ALL) ALL\n' in sudoers)
+    check('continuation rule kept active',
+          'bob\tALL=(ALL) ALL, \\\n\tPASSWD: /bin/ls\n' in sudoers, repr(sudoers))
+    check('nothing commented out', sudoers.count('#') == original_sudoers.count('#'))
+    check('rule of a user without password left alone', dropin == original_dropin)
+    check('skip reported in changes',
+          any(c.startswith('Skipped /etc/sudoers.d/90-cloud-init-users') for c in out['changes']),
+          str(out['changes']))
+    check('item stays risk but is no longer auto-fixable',
+          out['item']['status'] == 'risk' and out['item']['fixable'] is False)
     check('other sudoers rules untouched', 'root\tALL=(ALL:ALL) ALL' in sudoers)
-    check('check now passes', out['item']['status'] == 'ok')
     check('backup keeps original sudoers',
           io.open(os.path.join(data, 'backup', out.get('backup', ''), 'etc', 'sudoers'),
                   encoding='utf-8').read() == original_sudoers)
+    again = app.fix({'id': 'sudo_nopasswd'})
+    check('second run refuses instead of locking ubuntu out',
+          again.get('status') is False and 'lock its users out' in again.get('msg', ''),
+          again.get('msg'))
+    check('no temp file left behind', not leftovers(root), str(leftovers(root)))
 
     print('\n4. fix empty_password')
     out = app.fix({'id': 'empty_password'})
     check('fix returned success', out.get('status') is True, json.dumps(out)[:200])
+    bdir = os.path.join(data, 'backup', out.get('backup', ''))
+    check('no copy of /etc/shadow in the backup',
+          not os.path.exists(os.path.join(bdir, 'etc', 'shadow')))
+    check('locked accounts recorded by name',
+          json.load(io.open(os.path.join(bdir, 'manifest.json'))).get('accounts') == ['testuser'])
+    out_r = app.restore({'backup': out.get('backup')})
+    check('restore never unlocks an empty password account',
+          out_r.get('status') is False and 'not unlocked' in out_r.get('msg', ''),
+          out_r.get('msg'))
     check('shadow entry locked',
           re.search(r'^testuser:!', read(root, 'etc/shadow'), re.M) is not None)
     check('root hash untouched', 'root:$6$' in read(root, 'etc/shadow'))
@@ -217,6 +434,11 @@ def main():
           'PermitRootLogin prohibit-password' in read(root, 'etc/ssh/sshd_config'))
     check('ssh_root_login now ok', out['item']['status'] == 'ok')
     out = app.fix({'id': 'ssh_password_auth'})
+    check('lockout-risk fix needs confirm=1 in the API',
+          out.get('status') is False and out.get('need_confirm') is True)
+    check('sshd_config untouched without confirm',
+          'PasswordAuthentication yes' in read(root, 'etc/ssh/sshd_config'))
+    out = app.fix({'id': 'ssh_password_auth', 'confirm': '1'})
     check('PasswordAuthentication rewritten',
           'PasswordAuthentication no' in read(root, 'etc/ssh/sshd_config'))
     check('ssh_password_auth now ok', out['item']['status'] == 'ok')
@@ -227,7 +449,7 @@ def main():
     items = {i['id']: i for i in app.get_index({})['items']}
     check('drop-in value wins over sshd_config', items['ssh_password_auth']['status'] == 'risk',
           items['ssh_password_auth']['detail'])
-    out = app.fix({'id': 'ssh_password_auth'})
+    out = app.fix({'id': 'ssh_password_auth', 'confirm': '1'})
     check('drop-in was the file edited',
           'PasswordAuthentication no' in read(root, 'etc/ssh/sshd_config.d/50-cloud-init.conf'))
     check('main config left alone',
@@ -242,6 +464,15 @@ def main():
     check('only the too-permissive file is flagged', flagged == ['/etc/shadow'], str(flagged))
     check('stricter-than-needed mode is accepted',
           mod._perm_issues([('/etc/shadow', 0o000)]) == [])
+    check('debian 0640 root:shadow is accepted',
+          mod._perm_issues([('/etc/shadow', 0o640, 0, 42),
+                            ('/etc/gshadow', 0o640, 0, 42)]) == [])
+    grp = mod._perm_issues([('/etc/shadow', 0o640, 0, 0)])
+    check('0640 with group root is flagged, only the extra bit removed',
+          len(grp) == 1 and grp[0]['target'] == oct(0o600), str(grp))
+    own = mod._perm_issues([('/etc/passwd', 0o644, 1000, 0)])
+    check('non-root owner is flagged', len(own) == 1 and own[0]['bad_owner']
+          and not own[0]['bad_mode'], str(own))
     mod.PERM_RULES = []
 
     print('\n7. history + restore')
@@ -261,7 +492,10 @@ def main():
     items = {i['id']: i for i in res['items']}
     check('cli_timeout still ok after restore? no - risk again',
           items['cli_timeout']['status'] == 'risk')
-    check('sudo_nopasswd stays ok', items['sudo_nopasswd']['status'] == 'ok')
+    check('sudo_nopasswd keeps only the protected rule',
+          items['sudo_nopasswd']['status'] == 'risk'
+          and [r['file'] for r in items['sudo_nopasswd']['rules']]
+          == ['/etc/sudoers.d/90-cloud-init-users'])
     check('empty_password stays ok', items['empty_password']['status'] == 'ok')
     check('summary is consistent',
           res['summary']['total'] == len(res['items'])
@@ -351,6 +585,9 @@ def main():
     check('generic firewall advice still given',
           any('iptables' in c for i in res3['items'] if i['id'] == 'firewall'
               for c in i['commands']))
+
+    validators_and_exit_codes()
+    restore_safety()
 
     print('\n%d passed, %d failed' % (len(PASSED), len(FAILED)))
     shutil.rmtree(root, ignore_errors=True)

@@ -9,9 +9,16 @@ SSL) and can fix the auto-fixable ones in place.
 
 Safety model for every fix:
     1. every touched file is copied to data/backup/<id>/ first
-    2. the change is validated (visudo -c / sshd -t) when a validator exists
-    3. an invalid change is rolled back from the backup immediately
+    2. the new content is written to a temp file next to the target and
+       validated there (visudo -cf / sshd -t -f) before the target is touched
+    3. the temp file atomically replaces the target, then the full config is
+       validated again; a rejection rolls every file back immediately
     4. the check is re-run so the UI shows the real state, not an assumption
+
+Commands are always run through subprocess with an argument list (no shell)
+and their real exit status. The panel's public.ExecShell is deliberately not
+used: it returns (stdout, stderr) without the exit code, which would make
+every validator look successful.
 
 The class name must match the file name (aaPanel plugin contract).
 """
@@ -25,13 +32,13 @@ import stat
 import time
 import glob
 import shutil
+import hashlib
 import subprocess
 
 try:
-    import public  # provided by the panel at runtime
-except Exception:  # allows the rule engine to be tested outside the panel
-    public = None
-
+    from urllib.parse import urlparse
+except ImportError:  # pragma: no cover - python 2
+    from urlparse import urlparse
 
 # ---------------------------------------------------------------------------
 # paths
@@ -51,9 +58,21 @@ BACKUP_KEEP = 40
 
 RE_TMOUT = re.compile(r'^\s*(?:export\s+|readonly\s+)*TMOUT\s*=\s*["\']?(\d+)')
 RE_TMOUT_VALUE = re.compile(r'^(\s*(?:export\s+|readonly\s+)*TMOUT\s*=\s*["\']?)(\d+)')
-RE_NOPASSWD = re.compile(r'NOPASSWD\s*:', re.I)
+RE_NOPASSWD = re.compile(r'\bNOPASSWD\s*:')
+RE_NOPASSWD_TAG = re.compile(r'\bNOPASSWD\s*:\s*')
 RE_SSH_KEY = re.compile(r'^\s*([A-Za-z][A-Za-z0-9]*)\s+(.+?)\s*$')
+RE_SSH_MATCH = re.compile(r'^\s*Match\s', re.I)
 RE_BACKUP_ID = re.compile(r'^[0-9]{8}-[0-9]{6}-[a-z0-9_]+$')
+RE_USERNAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_.-]*\$?$')
+
+# files whose copies must never sit in a backup: they hold every password hash
+NO_BACKUP = ('/etc/shadow', '/etc/gshadow')
+
+# fixes that can lock the administrator out; the API demands confirm=1
+DANGEROUS = ('ssh_password_auth',)
+
+# test hook: a callable(args) -> (output, ok) that replaces real execution
+_RUNNER = None
 
 
 class FixError(Exception):
@@ -82,6 +101,14 @@ def _read(path, default=None):
         return default
 
 
+def _read_bytes(path):
+    try:
+        with open(_path(path), 'rb') as f:
+            return f.read()
+    except (IOError, OSError):
+        return None
+
+
 def _exists(path):
     return os.path.exists(_path(path))
 
@@ -93,50 +120,136 @@ def _mode(path):
         return None
 
 
-def _write(path, content, mode=None):
-    """Rewrite a file in place, keeping inode (SELinux context) and file mode."""
-    real = _path(path)
-    if mode is None:
-        mode = _mode(path)
+def _sha256(path):
     try:
-        with io.open(real, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(content)
-    except (IOError, OSError) as exc:
-        # a 0440 sudoers is not writable by the owner bit; root can still write,
-        # but be explicit so the plugin also works under a restricted user
-        if getattr(exc, 'errno', None) not in (13, 1):
-            raise
-        os.chmod(real, 0o600)
-        with io.open(real, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(content)
-    if mode is not None:
+        with open(_path(path), 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except (IOError, OSError):
+        return None
+
+
+def _copy_meta(src, dst):
+    """Give `dst` the owner, mode and SELinux label of `src` (best effort)."""
+    st = os.stat(src)
+    if hasattr(os, 'chown'):
         try:
-            os.chmod(real, mode)
+            os.chown(dst, st.st_uid, st.st_gid)
         except OSError:
             pass
+    if hasattr(os, 'getxattr'):
+        try:
+            os.setxattr(dst, 'security.selinux', os.getxattr(src, 'security.selinux'))
+        except (OSError, IOError):
+            pass
+    os.chmod(dst, stat.S_IMODE(st.st_mode))
 
 
-def _shell(cmd, timeout=20):
-    """Run a shell command, return (output, ok). Disabled inside a test sysroot."""
+def _tmp_name(real):
+    # a leading dot keeps the temp file out of sudoers.d (sudo skips names with
+    # a dot) and out of sshd_config.d/*.conf
+    return os.path.join(os.path.dirname(real),
+                        '.%s.secrisk-%d.tmp' % (os.path.basename(real), os.getpid()))
+
+
+def _stage(path, content):
+    """Write `content` to a temp file beside `path` with the same metadata.
+
+    Returns the temp path; the target itself is untouched, so a full disk or a
+    crash here can never leave /etc/sudoers or sshd_config truncated.
+    """
+    real = os.path.realpath(_path(path))
+    tmp = _tmp_name(real)
+    try:
+        if isinstance(content, bytes):
+            f = io.open(tmp, 'wb')
+        else:
+            f = io.open(tmp, 'w', encoding='utf-8', newline='\n')
+        with f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(real):
+            _copy_meta(real, tmp)
+    except (IOError, OSError):
+        _discard(tmp)
+        raise
+    return tmp
+
+
+def _discard(tmp):
+    try:
+        if os.path.exists(tmp):
+            os.chmod(tmp, 0o600)
+            os.remove(tmp)
+    except OSError:
+        pass
+
+
+def _commit(tmp, path):
+    """Atomically move a staged temp file over its target."""
+    real = os.path.realpath(_path(path))
+    try:
+        os.replace(tmp, real)
+    except OSError:
+        if os.name != 'nt' or not os.path.exists(real):
+            _discard(tmp)
+            raise
+        # Windows refuses to replace a read-only file (test fixtures only)
+        os.chmod(real, 0o600)
+        os.replace(tmp, real)
+
+
+def _write(path, content):
+    """Replace a file atomically, keeping its owner, mode and SELinux label."""
+    _commit(_stage(path, content), path)
+
+
+def _live():
+    """True when external commands may run (real host, or a test runner)."""
+    return _RUNNER is not None or not SYSROOT
+
+
+def _bin(name):
+    """Absolute path of a system binary, or None. sbin is searched explicitly
+    because the panel process does not always have it in PATH."""
+    if _RUNNER is not None:
+        return name
+    if SYSROOT:
+        return None
+    search = os.pathsep.join([os.environ.get('PATH', ''), '/usr/sbin', '/sbin',
+                              '/usr/local/sbin', '/usr/bin', '/bin'])
+    return shutil.which(name, path=search)
+
+
+def _run(args, timeout=20):
+    """Run a command without a shell, return (output, ok) from the real exit code."""
+    args = [str(a) for a in args]
+    if _RUNNER is not None:
+        return _RUNNER(args)
     if SYSROOT:
         return '', False
-    if public is not None:
-        try:
-            res = public.ExecShell(cmd)
-            if isinstance(res, (list, tuple)):
-                return '%s%s' % (res[0] or '', res[1] or ''), True
-            return res or '', True
-        except Exception:
-            pass
+    env = dict(os.environ, LC_ALL='C', LANG='C')  # validators are parsed in English
     try:
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT)
-        out = proc.communicate()[0]
-        if not isinstance(out, str):
-            out = out.decode('utf-8', 'replace')
-        return out, proc.returncode == 0
-    except Exception as exc:  # pragma: no cover - environment dependent
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, env=env)
+    except OSError as exc:
         return str(exc), False
+    try:
+        out = proc.communicate(timeout=timeout)[0]
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return 'timed out after %ds: %s' % (timeout, ' '.join(args)), False
+    if not isinstance(out, str):
+        out = out.decode('utf-8', 'replace')
+    return out, proc.returncode == 0
+
+
+def _run_bin(name, *args, **kw):
+    exe = _bin(name)
+    if not exe:
+        return '%s not found' % name, False
+    return _run([exe] + list(args), **kw)
 
 
 def _glob(pattern):
@@ -245,8 +358,7 @@ def _family_from_ids(os_id, id_like):
 def _has_bin(name):
     if SYSROOT:
         return False
-    out, ok = _shell('command -v %s >/dev/null 2>&1 && echo yes' % name)
-    return ok and 'yes' in out
+    return _bin(name) is not None
 
 
 def detect_os():
@@ -354,14 +466,21 @@ def _ensure_dirs():
         pass
 
 
-def _backup(paths, risk_id, modes=None):
+def _backup(paths, risk_id, modes=None, extra=None):
     """Copy files into a timestamped backup dir, return (backup_id, saved list)."""
     _ensure_dirs()
     stamp = time.strftime('%Y%m%d-%H%M%S')
     bid = '%s-%s' % (stamp, risk_id)
+    n = 1
+    while os.path.exists(os.path.join(BACKUP_PATH, bid)):
+        # two fixes in the same second must not overwrite each other's backup
+        n += 1
+        bid = '%s-%s_%d' % (stamp, risk_id, n)
     root = os.path.join(BACKUP_PATH, bid)
     saved = []
     for p in paths:
+        if p in NO_BACKUP:
+            raise FixError('Refusing to copy %s into a backup.' % p)
         real = _path(p)
         if not os.path.isfile(real):
             continue
@@ -374,12 +493,66 @@ def _backup(paths, risk_id, modes=None):
         saved.append({'path': p, 'file': rel, 'mode': _mode(p)})
     if not os.path.isdir(root):
         os.makedirs(root)
-    with io.open(os.path.join(root, 'manifest.json'), 'w', encoding='utf-8') as f:
-        f.write(json.dumps({'id': bid, 'risk': risk_id, 'time': int(time.time()),
-                            'files': saved, 'modes': modes or []},
-                           ensure_ascii=False, indent=2))
+    manifest = {'id': bid, 'risk': risk_id, 'time': int(time.time()),
+                'files': saved, 'modes': modes or []}
+    manifest.update(extra or {})
+    _save_manifest(bid, manifest)
     _prune_backups()
     return bid, saved
+
+
+def _manifest_path(bid):
+    return os.path.join(BACKUP_PATH, bid, 'manifest.json')
+
+
+def _load_manifest(bid):
+    with io.open(_manifest_path(bid), 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _save_manifest(bid, data):
+    with io.open(_manifest_path(bid), 'w', encoding='utf-8') as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _seal_backup(bid):
+    """Record the state right after a fix, so restore can tell whether the file
+    was edited again since then (restoring would silently undo that edit)."""
+    try:
+        data = _load_manifest(bid)
+    except (IOError, OSError, ValueError):
+        return
+    data['after'] = dict((e['path'], _sha256(e['path'])) for e in data.get('files', []))
+    for entry in data.get('modes', []):
+        entry['after'] = _mode(entry['path'])
+    _save_manifest(bid, data)
+
+
+def _purge_sensitive_backups():
+    """Remove password-hash copies left by plugin versions before 1.2."""
+    if not os.path.isdir(BACKUP_PATH):
+        return
+    for name in os.listdir(BACKUP_PATH):
+        if not RE_BACKUP_ID.match(name):
+            continue
+        try:
+            data = _load_manifest(name)
+        except (IOError, OSError, ValueError):
+            continue
+        keep = []
+        for entry in data.get('files', []):
+            if entry.get('path') in NO_BACKUP:
+                src = os.path.join(BACKUP_PATH, name, entry.get('file', ''))
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
+            else:
+                keep.append(entry)
+        if len(keep) != len(data.get('files', [])):
+            data['files'] = keep
+            data['note'] = 'Password hash copy removed for safety.'
+            _save_manifest(name, data)
 
 
 def _prune_backups():
@@ -545,6 +718,54 @@ def _fix_cli_timeout():
 
 
 # ---------------------------------------------------------------------------
+# accounts (shared by the sudo, permission and empty password checks)
+# ---------------------------------------------------------------------------
+
+def _shadow_map():
+    """{user: hash field} from /etc/shadow, or None when it is not readable."""
+    body = _read('/etc/shadow')
+    if body is None:
+        return None
+    out = {}
+    for line in body.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        parts = line.split(':')
+        if len(parts) >= 2 and parts[0]:
+            out[parts[0]] = parts[1]
+    return out
+
+
+def _usable_hash(value):
+    """A hash a user can actually type a password against (not empty, not locked)."""
+    return bool(value) and value[0] not in '!*'
+
+
+def _group_name(gid):
+    for line in (_read('/etc/group') or '').splitlines():
+        parts = line.split(':')
+        if len(parts) >= 3 and parts[2] == str(gid):
+            return parts[0]
+    return None
+
+
+def _group_members(name):
+    """Users covered by %name: listed members plus users with it as primary group."""
+    gid, members = None, set()
+    for line in (_read('/etc/group') or '').splitlines():
+        parts = line.split(':')
+        if len(parts) >= 4 and parts[0] == name:
+            gid = parts[2]
+            members.update(m.strip() for m in parts[3].split(',') if m.strip())
+    if gid is not None:
+        for line in (_read('/etc/passwd') or '').splitlines():
+            parts = line.split(':')
+            if len(parts) >= 4 and parts[3] == gid:
+                members.add(parts[0])
+    return members
+
+
+# ---------------------------------------------------------------------------
 # check 2 - passwordless sudo
 # ---------------------------------------------------------------------------
 
@@ -552,13 +773,49 @@ def _sudoers_files():
     files = ['/etc/sudoers']
     for p in _glob('/etc/sudoers.d/*'):
         base = os.path.basename(p)
-        if os.path.isdir(_path(p)) or base.endswith('~') or base.startswith('.'):
+        # sudo itself skips names with a dot or a trailing ~
+        if os.path.isdir(_path(p)) or base.endswith('~') or '.' in base:
             continue
         files.append(p)
     return files
 
 
-def _nopasswd_hits():
+def _rule_principals(text):
+    """User list of a sudoers rule ("alice, %adm  ALL=(ALL) ..." -> [alice, %adm])."""
+    tokens = text.split('=', 1)[0].split()
+    if len(tokens) < 2:
+        return None
+    return [u.strip() for u in ' '.join(tokens[:-1]).split(',') if u.strip()]
+
+
+def _password_gap(text, shadow):
+    """Why dropping NOPASSWD from this rule would leave someone unable to sudo.
+
+    Without NOPASSWD sudo asks for the user's own password. Cloud images create
+    the admin user (ubuntu, ec2-user, rocky ...) with a locked password, so
+    removing the tag there removes the only route to root. Returns '' when every
+    covered user has a usable password.
+    """
+    if shadow is None:
+        return '/etc/shadow is not readable, the users cannot be verified'
+    principals = _rule_principals(text)
+    if not principals:
+        return 'rule format not recognised'
+    users = set()
+    for p in principals:
+        if p.startswith('%') and RE_USERNAME.match(p[1:]):
+            users.update(_group_members(p[1:]))
+        elif RE_USERNAME.match(p) and not p.isupper():
+            users.add(p)
+        else:
+            return '"%s" (alias, ALL, uid or netgroup) cannot be verified' % p
+    missing = sorted(u for u in users if u != 'root' and not _usable_hash(shadow.get(u)))
+    if missing:
+        return 'no usable password for %s' % ', '.join(missing)
+    return ''
+
+
+def _nopasswd_hits(shadow=None):
     hits = []
     for path in _sudoers_files():
         body = _read(path)
@@ -569,12 +826,14 @@ def _nopasswd_hits():
                 continue
             if RE_NOPASSWD.search(text):
                 hits.append({'file': path, 'line': start + 1,
-                             'lines': end - start + 1, 'text': text.strip()})
+                             'lines': end - start + 1, 'text': text.strip(),
+                             'blocked': _password_gap(text, shadow)})
     return hits
 
 
 def check_sudo_nopasswd():
-    hits = _nopasswd_hits()
+    shadow = _shadow_map()
+    hits = _nopasswd_hits(shadow)
     if not hits:
         return _item(
             'sudo_nopasswd',
@@ -585,95 +844,132 @@ def check_sudo_nopasswd():
         )
 
     files = sorted(set(h['file'] for h in hits))
+    safe = [h for h in hits if not h['blocked']]
+    blocked = [h for h in hits if h['blocked']]
     detail = 'Passwordless sudo is allowed by %d rule(s): %s' % (
         len(hits), ', '.join(files))
+    if blocked:
+        detail += '. %d rule(s) are left alone because removing NOPASSWD would ' \
+                  'lock their users out of sudo.' % len(blocked)
     group = detect_os()['sudo_group']
+    plan = []
+    if safe:
+        plan = ['Back up %s' % ', '.join(sorted(set(h['file'] for h in safe))),
+                'Remove only the NOPASSWD: tag, the rule itself stays',
+                'Validate the new file with "visudo -cf" before it replaces the old one']
+        plan += ['  change %s:%d  %s' % (h['file'], h['line'], h['text'][:100])
+                 for h in safe[:6]]
+    plan += ['  skip   %s:%d  %s' % (h['file'], h['line'], h['blocked'])
+             for h in blocked[:6]]
     return _item(
         'sudo_nopasswd',
         'The following sudo files contain the NOPASSWD flag: %s' % ', '.join(files),
         'medium', 'risk',
         detail,
-        'Comment out or remove the NOPASSWD marker in the listed files. Sudo '
-        'will then ask for the user password again. Validate with "visudo -c". '
-        'On this distribution the admin group is "%' + group + '", so keep the '
-        'group rule and drop only the NOPASSWD part.',
-        fixable=True,
-        plan=['Back up %s' % ', '.join(files),
-              'Comment out every line that contains NOPASSWD:',
-              'Validate the result with "visudo -c" and roll back if it fails']
-             + ['  %s:%d  %s' % (h['file'], h['line'], h['text'][:110]) for h in hits[:6]],
+        'Remove the NOPASSWD tag so sudo asks for the user password again; keep '
+        'the rule itself. On this distribution the admin group is "%' + group + '". '
+        'Users without a password must get one first ("passwd <user>"), otherwise '
+        'they lose sudo entirely.',
+        fixable=bool(safe),
+        plan=plan,
         extra={'files': files,
-               'rules': [{'file': h['file'], 'line': h['line'],
-                          'text': h['text'][:200]} for h in hits]},
+               'rules': [{'file': h['file'], 'line': h['line'], 'text': h['text'][:200],
+                          'skip': h['blocked']} for h in hits]},
     )
 
 
-def _comment_nopasswd(body):
-    """Comment every physical line of a logical line containing NOPASSWD."""
-    target = set()
+def _strip_nopasswd(body, shadow):
+    """Drop the NOPASSWD: tag from every rule whose users can type a password.
+
+    Returns (new_body, changed_line_count, skipped [(line, text, reason)]).
+    """
+    targets, skipped = set(), []
     for start, end, text in _logical_lines(body):
-        if text.lstrip().startswith('#'):
+        if text.lstrip().startswith('#') or not RE_NOPASSWD.search(text):
             continue
-        if RE_NOPASSWD.search(text):
-            for k in range(start, end + 1):
-                target.add(k)
-    if not target:
-        return body, 0
+        gap = _password_gap(text, shadow)
+        if gap:
+            skipped.append((start + 1, text.strip(), gap))
+            continue
+        targets.update(range(start, end + 1))
     lines = body.splitlines(True)
-    out = []
-    for idx, raw in enumerate(lines):
-        if idx in target:
-            stripped = raw.rstrip('\r\n')
-            indent = re.match(r'^[ \t]*', stripped).group(0)
-            rest = stripped[len(indent):]
-            if not rest.startswith('#'):
-                stripped = indent + '# ' + rest
-            out.append(stripped + '\n')
-        else:
-            out.append(raw)
-    return ''.join(out), len(target)
+    count = 0
+    for idx in sorted(targets):
+        new = RE_NOPASSWD_TAG.sub('', lines[idx])
+        if new != lines[idx]:
+            lines[idx] = new
+            count += 1
+    return ''.join(lines), count, skipped
 
 
 def _fix_sudo_nopasswd():
-    hits = _nopasswd_hits()
+    shadow = _shadow_map()
+    hits = _nopasswd_hits(shadow)
     if not hits:
         raise FixError('No NOPASSWD rule is left to fix.')
-    files = sorted(set(h['file'] for h in hits))
+    files = sorted(set(h['file'] for h in hits if not h['blocked']))
+    if not files:
+        raise FixError('Nothing changed: every NOPASSWD rule would lock its users out '
+                       '(%s). Give them a password first.'
+                       % '; '.join('%s:%d %s' % (h['file'], h['line'], h['blocked'])
+                                   for h in hits))
+    if _live() and not _bin('visudo'):
+        raise FixError('visudo was not found; sudoers is never edited without validation.')
     bid, _ = _backup(files, 'sudo_nopasswd')
 
-    changes = []
-    originals = {}
-    for path in files:
-        body = _read(path, '')
-        originals[path] = body
-        new_body, count = _comment_nopasswd(body)
-        if not count:
-            continue
-        _write(path, new_body)
-        changes.append('Commented out %d line(s) in %s' % (count, path))
-
-    # sudo refuses to work with a broken config: validate and roll back.
-    if not SYSROOT:
-        broken = []
+    changes, originals, staged = [], {}, {}
+    try:
         for path in files:
-            if path not in originals or originals[path] == _read(path):
+            body = _read(path, '')
+            new_body, count, _skipped = _strip_nopasswd(body, shadow)
+            if not count:
                 continue
-            out, ok = _shell('visudo -cf %s' % path)
-            parsed = 'parsed ok' in out.lower()
-            if not ok or not parsed:
-                broken.append((path, (out.strip() or 'visudo rejected the file')[:300]))
-        if broken:
-            for path in originals:
-                _write(path, originals[path])
-            raise FixError('Rolled back, sudoers validation failed: %s'
-                           % '; '.join('%s: %s' % (p, m) for p, m in broken))
+            tmp = _stage(path, new_body)
+            staged[path] = tmp
+            originals[path] = body
+            if _live():
+                out, ok = _run_bin('visudo', '-c', '-f', tmp)
+                if not ok:
+                    raise FixError('visudo rejected the new %s, nothing was changed: %s'
+                                   % (path, out.strip()[:300] or 'unknown error'))
+            changes.append('Removed NOPASSWD from %d line(s) in %s' % (count, path))
+    except Exception:
+        for tmp in staged.values():
+            _discard(tmp)
+        raise
 
+    committed = []
+    try:
+        for path, tmp in staged.items():
+            _commit(tmp, path)
+            committed.append(path)
+        if _live():
+            # the main file pulls in every drop-in, so this checks the whole policy
+            out, ok = _run_bin('visudo', '-c', '-f', _path('/etc/sudoers'))
+            if not ok:
+                raise FixError('Rolled back, sudoers validation failed: %s'
+                               % (out.strip()[:300] or 'unknown error'))
+    except Exception:
+        for path in committed:
+            _write(path, originals[path])
+        for path, tmp in staged.items():
+            if path not in committed:
+                _discard(tmp)
+        raise
+
+    for h in hits:
+        if h['blocked']:
+            changes.append('Skipped %s:%d (%s)' % (h['file'], h['line'], h['blocked']))
     return {'changes': changes, 'backup': bid, 'reload': ''}
 
 
 # ---------------------------------------------------------------------------
 # check 3/4 - SSH hardening
 # ---------------------------------------------------------------------------
+
+# older OpenSSH reports the same setting under its previous name
+SSH_ALIASES = {'without-password': 'prohibit-password'}
+
 
 def _ssh_files():
     files = []
@@ -683,20 +979,38 @@ def _ssh_files():
     return [p for p in files if _exists(p)]
 
 
+def _ssh_global(body):
+    """Yield (index, key, value) for directives before the first Match block.
+
+    Anything after "Match" only applies to the matched connections, so it never
+    decides the global value.
+    """
+    for idx, line in enumerate(body.splitlines()):
+        if line.lstrip().startswith('#'):
+            continue
+        if RE_SSH_MATCH.match(line):
+            return
+        m = RE_SSH_KEY.match(line)
+        if m:
+            yield idx, m.group(1), m.group(2)
+
+
 def _ssh_effective(key):
     """Return (value, source) using sshd -T when possible, else config parsing."""
-    if not SYSROOT:
-        out, ok = _shell('sshd -T 2>/dev/null | grep -i "^%s " ' % key.lower())
-        if ok and out.strip():
-            return out.strip().split(None, 1)[1].strip().lower(), 'sshd -T'
+    if _live():
+        out, ok = _run_bin('sshd', '-T')
+        if ok:
+            for line in out.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and parts[0].lower() == key.lower():
+                    value = parts[1].strip().lower()
+                    return SSH_ALIASES.get(value, value), 'sshd -T'
+    # sshd uses the first value it reads; drop-ins are included before the rest
     for path in _ssh_files():
-        body = _read(path, '')
-        for line in body.splitlines():
-            if line.lstrip().startswith('#'):
-                continue
-            m = RE_SSH_KEY.match(line)
-            if m and m.group(1).lower() == key.lower():
-                return m.group(2).strip().lower(), path
+        for _idx, k, v in _ssh_global(_read(path, '')):
+            if k.lower() == key.lower():
+                value = v.strip().lower()
+                return SSH_ALIASES.get(value, value), path
     return None, None
 
 
@@ -719,9 +1033,10 @@ def check_ssh_root_login():
             'Set "PermitRootLogin prohibit-password" so root can only log in '
             'with a key, then run "sshd -t" and reload sshd.',
             fixable=True,
-            plan=['Back up %s' % source,
+            plan=['Back up the file that declares PermitRootLogin',
                   'Set PermitRootLogin prohibit-password',
-                  'Validate with "sshd -t", reload sshd, roll back on failure'],
+                  'Validate with "sshd -t" before and after replacing the file, '
+                  'then reload sshd; roll back on failure'],
             extra={'value': value, 'source': source},
         )
     return _item(
@@ -755,9 +1070,10 @@ def check_ssh_password_auth():
             '"PasswordAuthentication no", then reload sshd.',
             fixable=True,
             danger=True,
-            plan=['Back up %s' % source,
+            plan=['Back up the file that declares PasswordAuthentication',
                   'Set PasswordAuthentication no',
-                  'Validate with "sshd -t", reload sshd, roll back on failure',
+                  'Validate with "sshd -t" before and after replacing the file, '
+                  'then reload sshd; roll back on failure',
                   'Make sure you have a working SSH key before confirming'],
             extra={'value': value, 'source': source},
         )
@@ -772,15 +1088,23 @@ def check_ssh_password_auth():
 
 
 def _ssh_declared_file(key):
-    """First file that actively declares `key` (drop-ins are read before the main file)."""
+    """First file that globally declares `key` (drop-ins are read before the main file)."""
     for path in _ssh_files():
-        body = _read(path, '')
-        for line in body.splitlines():
-            if line.lstrip().startswith('#'):
-                continue
-            m = RE_SSH_KEY.match(line)
-            if m and m.group(1).lower() == key.lower():
+        for _idx, k, _v in _ssh_global(_read(path, '')):
+            if k.lower() == key.lower():
                 return path
+    return None
+
+
+def _reload_sshd():
+    # Debian/Ubuntu call the unit "ssh", RHEL family calls it "sshd"
+    svc = detect_os()['ssh_service']
+    other = 'ssh' if svc == 'sshd' else 'sshd'
+    for args in (('systemctl', 'reload', svc), ('systemctl', 'reload', other),
+                 ('service', svc, 'reload'), ('service', other, 'reload')):
+        _out, ok = _run_bin(*args)
+        if ok:
+            return args[2] if args[0] == 'systemctl' else args[1]
     return None
 
 
@@ -788,56 +1112,70 @@ def _set_ssh_key(key, value):
     files = _ssh_files()
     if not files:
         raise FixError('sshd_config not found.')
+    if _live() and not _bin('sshd'):
+        raise FixError('sshd was not found; sshd_config is never edited without "sshd -t".')
     # edit the file that actually carries the directive, otherwise sshd keeps
     # using the value from an earlier Include
     path = _ssh_declared_file(key) or '/etc/ssh/sshd_config'
     body = _read(path, '')
-    bid, _ = _backup([path], 'ssh_%s' % key.lower())
 
     lines = body.splitlines(True)
-    hit = False
-    for idx, raw in enumerate(lines):
-        if raw.lstrip().startswith('#'):
-            continue
-        m = RE_SSH_KEY.match(raw)
-        if m and m.group(1).lower() == key.lower():
-            lines[idx] = '%s %s\n' % (key, value)
-            hit = True
+    new_line = '%s %s\n' % (key, value)
+    target = None
+    for idx, k, _v in _ssh_global(body):
+        if k.lower() == key.lower():
+            target = idx
             break
-    if not hit:
-        if lines and not lines[-1].endswith('\n'):
-            lines[-1] += '\n'
-        lines.append('%s %s\n' % (key, value))
-    _write(path, ''.join(lines))
+    if target is not None:
+        lines[target] = new_line
+    else:
+        # appended after a Match block it would only apply inside that block
+        at = None
+        for idx, raw in enumerate(lines):
+            if RE_SSH_MATCH.match(raw):
+                at = idx
+                break
+        if at is None:
+            if lines and not lines[-1].endswith('\n'):
+                lines[-1] += '\n'
+            lines.append(new_line)
+        else:
+            lines.insert(at, new_line)
 
+    bid, _ = _backup([path], 'ssh_%s' % key.lower())
+    tmp = _stage(path, ''.join(lines))
+    if _live():
+        out, ok = _run_bin('sshd', '-t', '-f', tmp)
+        if not ok:
+            _discard(tmp)
+            raise FixError('"sshd -t" rejected the new %s, nothing was changed: %s'
+                           % (path, out.strip()[:300] or 'unknown error'))
+    _commit(tmp, path)
     changes = ['Set %s %s in %s' % (key, value, path)]
-    if not SYSROOT:
-        out, ok = _shell('sshd -t')
+
+    if _live():
+        out, ok = _run_bin('sshd', '-t')
         if not ok:
             _write(path, body)
-            raise FixError('Rolled back, "sshd -t" rejected the change: %s'
+            raise FixError('Rolled back, "sshd -t" rejected the full configuration: %s'
                            % (out.strip()[:300] or 'unknown error'))
 
-        # Debian/Ubuntu call the unit "ssh", RHEL family calls it "sshd"
-        svc = detect_os()['ssh_service']
-        other = 'ssh' if svc == 'sshd' else 'sshd'
-        reload_out, reload_ok = _shell(
-            'systemctl reload %(a)s 2>/dev/null || systemctl reload %(b)s 2>/dev/null '
-            '|| service %(a)s reload 2>/dev/null || service %(b)s reload 2>/dev/null'
-            % {'a': svc, 'b': other})
-        if reload_ok:
-            changes.append('Reloaded %s' % svc)
-        else:
-            changes.append('Config saved but reload failed - run '
-                           '"systemctl reload %s" manually' % svc)
-
-    # confirm the new value is really the effective one, otherwise another file wins
+    # confirm the new value is really the effective one before sshd reloads it,
+    # so a rollback here never leaves the running daemon on a different config
     now, now_src = _ssh_effective(key)
     if now is not None and now != value:
         _write(path, body)
         raise FixError('Rolled back: %s still resolves to "%s" (from %s), the value '
                        'is overridden by another config file.'
                        % (key, now, now_src))
+
+    if _live():
+        svc = _reload_sshd()
+        if svc:
+            changes.append('Reloaded %s' % svc)
+        else:
+            changes.append('Config saved but reload failed - run "systemctl reload %s" '
+                           'manually' % detect_os()['ssh_service'])
     return {'changes': changes, 'backup': bid, 'reload': ''}
 
 
@@ -854,36 +1192,51 @@ def _fix_ssh_password_auth():
 # ---------------------------------------------------------------------------
 
 PERM_RULES = [
-    ('/etc/passwd', 0o644),
-    ('/etc/shadow', 0o600),
-    ('/etc/group', 0o644),
-    ('/etc/gshadow', 0o600),
-    ('/etc/sudoers', 0o440),
-    ('/etc/ssh/sshd_config', 0o600),
+    # (path, max mode, group that may additionally read the file)
+    ('/etc/passwd', 0o644, None),
+    # Debian/Ubuntu ship 0640 root:shadow so setgid unix_chkpwd can verify
+    # passwords; forcing 0600 there breaks screen lockers and PAM helpers
+    ('/etc/shadow', 0o600, 'shadow'),
+    ('/etc/group', 0o644, None),
+    ('/etc/gshadow', 0o600, 'shadow'),
+    ('/etc/sudoers', 0o440, None),
+    ('/etc/ssh/sshd_config', 0o600, None),
 ]
 
 
 def _perm_issues(entries=None):
-    """Return files whose mode has bits outside the allowed mask.
+    """Return files whose mode has bits outside the allowed mask, or a non-root owner.
 
-    `entries` is a list of (path, mode) pairs; when omitted the live files are read.
-    Kept separable so the rule can be unit-tested without touching the filesystem.
+    `entries` is a list of (path, mode) or (path, mode, uid, gid) tuples; when
+    omitted the live files are read. Kept separable so the rule can be
+    unit-tested without touching the filesystem.
     """
-    wants = dict(PERM_RULES)
+    rules = dict((r[0], r) for r in PERM_RULES)
     if entries is None:
         entries = []
-        for path, _want in PERM_RULES:
-            if _exists(path):
-                cur = _mode(path)
-                if cur is not None:
-                    entries.append((path, cur))
+        for path, _max, _grp in PERM_RULES:
+            try:
+                st = os.stat(_path(path))
+            except OSError:
+                continue
+            entries.append((path, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid))
     issues = []
-    for path, cur in entries:
-        want = wants.get(path)
-        if want is None:
+    for entry in entries:
+        path, cur = entry[0], entry[1]
+        uid = entry[2] if len(entry) > 2 else 0
+        gid = entry[3] if len(entry) > 3 else None
+        rule = rules.get(path)
+        if rule is None:
             continue
-        if cur & ~want:  # any bit outside the allowed mask = too permissive
-            issues.append({'path': path, 'current': oct(cur), 'want': oct(want)})
+        want = rule[1]
+        if rule[2] and gid is not None and _group_name(gid) == rule[2]:
+            want |= 0o040
+        bad_mode = bool(cur & ~want)  # any bit outside the allowed mask
+        bad_owner = uid != 0
+        if bad_mode or bad_owner:
+            issues.append({'path': path, 'current': oct(cur), 'want': oct(want),
+                           'target': oct(cur & want), 'uid': uid,
+                           'bad_mode': bad_mode, 'bad_owner': bad_owner})
     return issues
 
 
@@ -894,21 +1247,29 @@ def check_file_permissions():
             'file_permissions',
             'Sensitive system files have safe permissions',
             'low', 'ok',
-            'All checked files are at or below their maximum allowed mode.',
+            'All checked files are owned by root and at or below their maximum mode.',
             'No action needed.',
         )
-    detail = '; '.join('%s is %s (max %s)' % (i['path'], i['current'], i['want'])
-                       for i in issues)
+    parts = []
+    plan = []
+    for i in issues:
+        if i['bad_mode']:
+            parts.append('%s is %s (max %s)' % (i['path'], i['current'], i['want']))
+            plan.append('chmod %s %s' % (i['target'][2:], i['path']))
+        if i['bad_owner']:
+            parts.append('%s is owned by uid %s' % (i['path'], i['uid']))
+            plan.append('chown root %s' % i['path'])
     critical = any(i['path'] in ('/etc/shadow', '/etc/sudoers') for i in issues)
     return _item(
         'file_permissions',
         'Sensitive system files are readable by more users than needed',
         'high' if critical else 'medium', 'risk',
-        detail,
-        'Restore the standard modes: 644 /etc/passwd, 644 /etc/group, '
-        '600 /etc/shadow, 600 /etc/gshadow, 440 /etc/sudoers, 600 sshd_config.',
+        '; '.join(parts),
+        'Restore the standard modes: 644 /etc/passwd, 644 /etc/group, 600 /etc/shadow '
+        'and /etc/gshadow (640 when the group is "shadow"), 440 /etc/sudoers, '
+        '600 sshd_config, all owned by root. Only the extra bits are removed.',
         fixable=True,
-        plan=['chmod %s %s' % (i['want'], i['path']) for i in issues],
+        plan=plan,
         extra={'files': issues},
     )
 
@@ -917,15 +1278,20 @@ def _fix_file_permissions():
     issues = _perm_issues()
     if not issues:
         raise FixError('Permissions already correct.')
-    previous = [{'path': i['path'], 'mode': int(i['current'], 8)} for i in issues]
+    previous = [{'path': i['path'], 'mode': int(i['current'], 8), 'uid': i['uid']}
+                for i in issues]
     bid, _ = _backup([], 'file_permissions', previous)
     changes = []
     for i in issues:
         try:
-            os.chmod(_path(i['path']), int(i['want'], 8))
-            changes.append('%s: %s -> %s' % (i['path'], i['current'], i['want']))
+            if i['bad_owner'] and hasattr(os, 'chown'):
+                os.chown(_path(i['path']), 0, -1)
+                changes.append('%s: owner uid %s -> root' % (i['path'], i['uid']))
+            if i['bad_mode']:
+                os.chmod(_path(i['path']), int(i['target'], 8))
+                changes.append('%s: %s -> %s' % (i['path'], i['current'], i['target']))
         except OSError as exc:
-            raise FixError('chmod failed on %s: %s' % (i['path'], exc))
+            raise FixError('chmod/chown failed on %s: %s' % (i['path'], exc))
     return {'changes': changes, 'backup': bid, 'reload': ''}
 
 
@@ -934,19 +1300,10 @@ def _fix_file_permissions():
 # ---------------------------------------------------------------------------
 
 def _empty_password_users():
-    body = _read('/etc/shadow')
-    if body is None:
+    shadow = _shadow_map()
+    if shadow is None:
         return None
-    users = []
-    for line in body.splitlines():
-        if not line.strip() or line.startswith('#'):
-            continue
-        parts = line.split(':')
-        if len(parts) < 2:
-            continue
-        if parts[1] == '':
-            users.append(parts[0])
-    return users
+    return [user for user, value in shadow.items() if value == '']
 
 
 def check_empty_password():
@@ -976,7 +1333,9 @@ def check_empty_password():
         'Never leave a login account without a hash.',
         fixable=True,
         plan=['Lock the account(s) with "passwd -l %s"' % '", "'.join(users),
-              'Back up /etc/shadow first'],
+              'Re-read /etc/shadow to confirm every account is locked',
+              'No copy of /etc/shadow is kept; to undo, set a password with '
+              '"passwd <user>"'],
         extra={'users': users},
     )
 
@@ -985,15 +1344,23 @@ def _fix_empty_password():
     users = _empty_password_users() or []
     if not users:
         raise FixError('No empty password account is left.')
-    bid, _ = _backup(['/etc/shadow'], 'empty_password')
-    changes = []
-    for user in users:
-        if not SYSROOT:
-            out, ok = _shell('passwd -l %s' % user)
+    odd = [u for u in users if not RE_USERNAME.match(u)]
+    if odd:
+        raise FixError('Unexpected user name(s) in /etc/shadow: %s. Lock them by hand.'
+                       % ', '.join(repr(u) for u in odd))
+    if _live() and not _bin('passwd'):
+        raise FixError('passwd was not found.')
+    # only the account names are recorded: a copy of /etc/shadow would keep every
+    # password hash on disk and a restore would bring old passwords back
+    bid, _ = _backup([], 'empty_password', extra={'accounts': users})
+
+    errors = []
+    if _live():
+        for user in users:
+            out, ok = _run_bin('passwd', '-l', user)
             if not ok:
-                raise FixError('passwd -l %s failed: %s' % (user, out.strip()[:200]))
-        changes.append('Locked account %s' % user)
-    if SYSROOT:
+                errors.append('%s: %s' % (user, out.strip()[:200] or 'passwd -l failed'))
+    else:
         # simulate the lock so the test-suite can verify the flow end to end
         body = _read('/etc/shadow', '')
         out_lines = []
@@ -1004,7 +1371,14 @@ def _fix_empty_password():
                 line = ':'.join(parts)
             out_lines.append(line)
         _write('/etc/shadow', '\n'.join(out_lines) + '\n')
-    return {'changes': changes, 'backup': bid, 'reload': ''}
+
+    # trust the file, not the exit code
+    left = _empty_password_users() or []
+    if left:
+        raise FixError('Still without a password: %s. %s'
+                       % (', '.join(left), '; '.join(errors)))
+    return {'changes': ['Locked account %s' % u for u in users],
+            'backup': bid, 'reload': ''}
 
 
 # ---------------------------------------------------------------------------
@@ -1051,18 +1425,21 @@ def check_firewall():
         active = True
         evidence.append('ufw enabled in /etc/ufw/ufw.conf')
 
-    if not SYSROOT:
-        out, ok = _shell('firewall-cmd --state 2>/dev/null')
-        if ok and 'running' in out.lower():
+    if _live():
+        # "firewall-cmd --state" prints "not running" when stopped, so compare
+        # the whole answer and the exit code, not a substring
+        out, ok = _run_bin('firewall-cmd', '--state')
+        if ok and out.strip().lower() == 'running':
             active = True
             evidence.append('firewalld is running')
-        out, ok = _shell('ufw status 2>/dev/null | head -1')
-        if ok and 'status: active' in out.lower():
+        out, ok = _run_bin('ufw', 'status')
+        if ok and out.strip().lower().startswith('status: active'):
             active = True
             evidence.append('ufw status: active')
-        out, ok = _shell('iptables -S 2>/dev/null | grep -c "^-A"')
-        if ok and out.strip().isdigit() and int(out.strip()) > 0:
-            evidence.append('iptables has %s rule(s)' % out.strip())
+        out, ok = _run_bin('iptables', '-S')
+        rules = [l for l in out.splitlines() if l.startswith('-A')] if ok else []
+        if rules:
+            evidence.append('iptables has %d rule(s)' % len(rules))
 
     if active:
         return _item(
@@ -1097,10 +1474,10 @@ def check_fail2ban():
     profile = detect_os()
     installed = _exists('/etc/fail2ban') or _exists('/etc/fail2ban/jail.conf')
     running = False
-    if not SYSROOT:
-        out, ok = _shell('fail2ban-client status 2>/dev/null')
+    if _live():
+        out, ok = _run_bin('fail2ban-client', 'status')
         running = ok and 'jail list' in out.lower()
-    if installed and (running or SYSROOT):
+    if installed and (running or not _live()):
         return _item(
             'fail2ban',
             'Fail2ban is installed',
@@ -1230,9 +1607,11 @@ def check_apparmor():
     body = _read('/sys/module/apparmor/parameters/enabled')
     if body and body.strip().lower().startswith('y'):
         enabled = True
-    if not SYSROOT:
-        out, ok = _shell('aa-status --enabled 2>/dev/null')
-        if ok and not out.strip():
+    if _live() and not enabled:
+        # exit code 0 is the only "enabled" answer; a missing aa-status binary
+        # also prints nothing, which used to be read as enabled
+        _out, ok = _run_bin('aa-status', '--enabled')
+        if ok:
             enabled = True
 
     if enabled:
@@ -1338,7 +1717,7 @@ def _system_info():
     except Exception:
         pass
     if not SYSROOT:
-        out, ok = _shell('uname -r')
+        out, ok = _run_bin('uname', '-r')
         if ok:
             info['kernel'] = out.strip()
         if _exists('/www/server/panel/class/common.py'):
@@ -1358,6 +1737,43 @@ def _find(risk_id):
 
 
 # ---------------------------------------------------------------------------
+# request guards
+# ---------------------------------------------------------------------------
+
+def _truthy(value):
+    return str(value or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _cross_site_request():
+    """True when a browser sent this request from another origin (CSRF).
+
+    Browsers always attach Origin (or at least Referer) to a cross-site POST, so
+    a mismatch with the panel's own host means another page is driving the
+    admin's session. Clients without either header (curl, the panel itself)
+    still need the panel session.
+    """
+    try:
+        from flask import request
+        headers = request.headers
+        hosts = set([request.host.lower()])
+        for h in (headers.get('X-Forwarded-Host') or '').split(','):
+            if h.strip():
+                hosts.add(h.strip().lower())
+    except Exception:  # not inside a flask request (tests, CLI)
+        return False
+    src = (headers.get('Origin') or headers.get('Referer') or '').strip()
+    if not src:
+        return False
+    if src.lower() == 'null':
+        return True
+    return urlparse(src).netloc.lower() not in hosts
+
+
+def _is_sudoers(path):
+    return path == '/etc/sudoers' or path.startswith('/etc/sudoers.d/')
+
+
+# ---------------------------------------------------------------------------
 # plugin class - methods here are callable from index.html
 # ---------------------------------------------------------------------------
 
@@ -1372,17 +1788,21 @@ class securityrisk_main:
         here disables that shortcut entirely while the authenticated router keeps
         working.
         """
-        if os.environ.get('SECRISK_ALLOW_ANON') == '1':
+        # the debug switch only works inside a test sysroot, never on a real host
+        if os.environ.get('SECRISK_ALLOW_ANON') == '1' and SYSROOT:
             return True
         try:
             from flask import session
         except Exception:
             return False
-        if len(session) == 0:
+        try:
+            if len(session) == 0:
+                return False
+            for key in ('login', 'uid', 'user', 'username'):
+                if session.get(key):
+                    return True
+        except Exception:
             return False
-        for key in ('login', 'uid', 'user', 'username'):
-            if session.get(key):
-                return True
         return False
 
     def index(self, args):
@@ -1396,6 +1816,7 @@ class securityrisk_main:
 
     def get_index(self, args):
         _ensure_dirs()
+        _purge_sensitive_backups()
         items, summary = run_checks()
         last = _read_log(1)
         return {
@@ -1416,10 +1837,17 @@ class securityrisk_main:
         return {'status': True, 'item': item}
 
     def fix(self, args):
-        rid = (args or {}).get('id', '')
+        args = args or {}
+        rid = args.get('id', '')
+        if _cross_site_request():
+            return {'status': False, 'msg': 'Cross-site request refused.'}
         fixer = FIXERS.get(rid)
         if not fixer:
             return {'status': False, 'msg': 'This risk has no automatic fix.'}
+        if rid in DANGEROUS and not _truthy(args.get('confirm')):
+            return {'status': False, 'need_confirm': True,
+                    'msg': 'This fix can lock you out of SSH. Test key login in a '
+                           'second session, then confirm (confirm=1).'}
         try:
             result = fixer()
         except FixError as exc:
@@ -1431,6 +1859,8 @@ class securityrisk_main:
             return {'status': False, 'msg': 'Unexpected error: %s' % exc,
                     'item': _find(rid)}
 
+        if result.get('backup'):
+            _seal_backup(result['backup'])
         item = _find(rid)
         entry = {
             'id': rid,
@@ -1454,15 +1884,13 @@ class securityrisk_main:
     def list_backups(self, args):
         if not os.path.isdir(BACKUP_PATH):
             return {'status': True, 'items': []}
+        _purge_sensitive_backups()
         items = []
         for name in sorted(os.listdir(BACKUP_PATH), reverse=True):
-            root = os.path.join(BACKUP_PATH, name)
-            manifest = os.path.join(root, 'manifest.json')
-            if not os.path.isfile(manifest):
+            if not RE_BACKUP_ID.match(name) or not os.path.isfile(_manifest_path(name)):
                 continue
             try:
-                with io.open(manifest, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                data = _load_manifest(name)
             except Exception:
                 continue
             data['id'] = name
@@ -1470,54 +1898,144 @@ class securityrisk_main:
         return {'status': True, 'items': items[:30]}
 
     def restore(self, args):
-        bid = (args or {}).get('backup', '')
+        args = args or {}
+        if _cross_site_request():
+            return {'status': False, 'msg': 'Cross-site request refused.'}
+        bid = args.get('backup', '')
+        force = _truthy(args.get('force'))
         if not RE_BACKUP_ID.match(bid or ''):
             return {'status': False, 'msg': 'Invalid backup id.'}
         root = os.path.join(BACKUP_PATH, bid)
-        manifest = os.path.join(root, 'manifest.json')
-        if not os.path.isfile(manifest):
+        if not os.path.isfile(_manifest_path(bid)):
             return {'status': False, 'msg': 'Backup not found.'}
         try:
-            with io.open(manifest, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            data = _load_manifest(bid)
         except Exception as exc:
             return {'status': False, 'msg': 'Cannot read manifest: %s' % exc}
 
-        restored = []
+        real_root = os.path.realpath(root) + os.sep
+        files = []
         for entry in data.get('files', []):
-            src = os.path.join(root, entry.get('file', ''))
-            dst = _path(entry.get('path', ''))
-            if not os.path.isfile(src) or not dst:
+            path = entry.get('path') or ''
+            src = os.path.realpath(os.path.join(root, entry.get('file') or ''))
+            # the manifest decides nothing outside /etc or outside its own folder
+            if (path in NO_BACKUP or not path.startswith('/etc/')
+                    or '..' in path.split('/') or not src.startswith(real_root)
+                    or not os.path.isfile(src)):
                 continue
-            parent = os.path.dirname(dst)
-            if parent and not os.path.isdir(parent):
-                continue
-            try:
-                shutil.copy2(src, dst)
-                if entry.get('mode') is not None:
-                    os.chmod(dst, entry['mode'])
-                restored.append(entry['path'])
-            except (OSError, IOError) as exc:
-                return {'status': False, 'msg': 'Restore failed on %s: %s'
-                        % (entry.get('path'), exc)}
+            files.append((entry, src))
+        modes = [m for m in data.get('modes', [])
+                 if (m.get('path') or '').startswith('/etc/') and m.get('mode') is not None]
 
-        for entry in data.get('modes', []):
-            dst = _path(entry.get('path', ''))
-            if not dst or not os.path.isfile(dst):
+        if not files and not modes:
+            if data.get('accounts'):
+                return {'status': False,
+                        'msg': 'Locked accounts (%s) are not unlocked automatically: that '
+                               'would bring back a login without password. Set a password '
+                               'with "passwd <user>" instead.' % ', '.join(data['accounts'])}
+            return {'status': False, 'msg': 'Nothing to restore in this backup.'}
+
+        # refuse to silently undo edits made after the fix
+        after = data.get('after')
+        drift = []
+        for entry, _src in files:
+            if after is None or after.get(entry['path']) != _sha256(entry['path']):
+                drift.append(entry['path'])
+        for m in modes:
+            if m.get('after') is None or _mode(m['path']) != m['after']:
+                drift.append('%s (mode)' % m['path'])
+        if drift and not force:
+            return {'status': False, 'drift': drift,
+                    'msg': 'Changed since this fix (or the backup predates v1.2): %s. '
+                           'Restoring would undo those edits; confirm to restore anyway.'
+                           % ', '.join(drift)}
+
+        sudo_touched = any(_is_sudoers(e['path']) for e, _s in files)
+        ssh_touched = any(e['path'].startswith('/etc/ssh/') for e, _s in files)
+        if _live() and sudo_touched and not _bin('visudo'):
+            return {'status': False, 'msg': 'visudo not found; sudoers is never restored '
+                                            'without validation.'}
+        if _live() and ssh_touched and not _bin('sshd'):
+            return {'status': False, 'msg': 'sshd not found; sshd_config is never restored '
+                                            'without "sshd -t".'}
+
+        current, staged = {}, {}
+        try:
+            for entry, src in files:
+                path = entry['path']
+                if not os.path.isdir(os.path.dirname(_path(path))):
+                    continue
+                with open(src, 'rb') as f:
+                    content = f.read()
+                current[path] = _read_bytes(path)
+                tmp = _stage(path, content)
+                staged[path] = tmp
+                if entry.get('mode') is not None:
+                    os.chmod(tmp, entry['mode'])
+                if _live() and _is_sudoers(path):
+                    out, ok = _run_bin('visudo', '-c', '-f', tmp)
+                    if not ok:
+                        raise FixError('visudo rejected the backup of %s: %s'
+                                       % (path, out.strip()[:300] or 'unknown error'))
+                if _live() and path.startswith('/etc/ssh/'):
+                    out, ok = _run_bin('sshd', '-t', '-f', tmp)
+                    if not ok:
+                        raise FixError('"sshd -t" rejected the backup of %s: %s'
+                                       % (path, out.strip()[:300] or 'unknown error'))
+        except (FixError, IOError, OSError) as exc:
+            for tmp in staged.values():
+                _discard(tmp)
+            return {'status': False, 'msg': 'Nothing was restored: %s' % exc}
+
+        restored = []
+        try:
+            for path, tmp in staged.items():
+                _commit(tmp, path)
+                restored.append(path)
+            if _live() and sudo_touched:
+                out, ok = _run_bin('visudo', '-c', '-f', _path('/etc/sudoers'))
+                if not ok:
+                    raise FixError('sudoers validation failed: %s' % out.strip()[:300])
+            if _live() and ssh_touched:
+                out, ok = _run_bin('sshd', '-t')
+                if not ok:
+                    raise FixError('"sshd -t" failed: %s' % out.strip()[:300])
+        except (FixError, IOError, OSError) as exc:
+            for path in restored:
+                if current.get(path) is None:
+                    try:
+                        os.remove(_path(path))
+                    except OSError:
+                        pass
+                else:
+                    _write(path, current[path])
+            for path, tmp in staged.items():
+                if path not in restored:
+                    _discard(tmp)
+            return {'status': False, 'msg': 'Rolled back, restore failed: %s' % exc}
+
+        for m in modes:
+            dst = _path(m['path'])
+            if not os.path.isfile(dst):
                 continue
             try:
-                os.chmod(dst, entry['mode'])
-                restored.append('%s (mode)' % entry['path'])
+                os.chmod(dst, m['mode'])
+                if m.get('uid') not in (None, 0) and hasattr(os, 'chown'):
+                    os.chown(dst, m['uid'], -1)
+                restored.append('%s (mode)' % m['path'])
             except (OSError, IOError) as exc:
                 return {'status': False, 'msg': 'chmod failed on %s: %s'
-                        % (entry.get('path'), exc)}
+                        % (m['path'], exc)}
 
-        if not restored:
-            return {'status': False, 'msg': 'Nothing to restore in this backup.'}
+        changes = ['Restored ' + ', '.join(restored)]
+        if _live() and ssh_touched:
+            svc = _reload_sshd()
+            changes.append('Reloaded %s' % svc if svc else
+                           'Reload sshd manually: the automatic reload failed')
         _log({'id': data.get('risk', ''), 'title': 'Restore %s' % bid, 'ok': True,
-              'changes': ['Restored ' + ', '.join(restored)], 'backup': bid})
+              'changes': changes, 'backup': ''})
         return {'status': True, 'msg': 'Restored %d file(s).' % len(restored),
-                'changes': ['Restored ' + ', '.join(restored)]}
+                'changes': changes}
 
 
 # CLI entry point: `python securityrisk_main.py scan` for quick server checks
@@ -1527,7 +2045,9 @@ if __name__ == '__main__':
         _items, _summary = run_checks()
         print(json.dumps({'summary': _summary, 'items': _items},
                          ensure_ascii=False, indent=2))
-    elif cmd == 'fix' and len(sys.argv) > 2:
-        print(json.dumps(FIXERS[sys.argv[2]](), ensure_ascii=False, indent=2))
+    elif cmd == 'fix' and len(sys.argv) > 2 and sys.argv[2] in FIXERS:
+        # the operator typed the id on the server, which is the confirmation
+        print(json.dumps(securityrisk_main().fix({'id': sys.argv[2], 'confirm': '1'}),
+                         ensure_ascii=False, indent=2))
     else:
-        print('usage: securityrisk_main.py [scan|fix <risk_id>]')
+        print('usage: securityrisk_main.py [scan|fix <%s>]' % '|'.join(sorted(FIXERS)))

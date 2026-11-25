@@ -72,12 +72,14 @@ Yang ikut menyesuaikan:
 
 | Langkah | Detail |
 |---|---|
-| Backup | Semua file yang disentuh disalin ke `data/backup/<waktu>-<id>/` sebelum ditulis, lengkap dengan `manifest.json` (path asli + mode). |
-| Tulis | File ditulis *in place* (inode & konteks SELinux tidak berubah), mode file dipertahankan. |
-| Validasi | `visudo -cf <file>` untuk sudoers, `sshd -t` untuk SSH. |
-| Rollback | Jika validasi gagal, isi file dikembalikan dari backup dan API mengembalikan `status:false` beserta pesan aslinya. |
-| Verifikasi | Pemeriksaan dijalankan ulang; UI menampilkan status baru, bukan asumsi "berhasil". |
+| Backup | Semua file yang disentuh disalin ke `data/backup/<waktu>-<id>/` sebelum ditulis, lengkap dengan `manifest.json` (path asli + mode). `/etc/shadow` dan `/etc/gshadow` **tidak pernah** disalin: fix akun hanya mencatat nama akun. |
+| Tulis | Isi baru ditulis ke file sementara di direktori yang sama (fsync), diberi owner, mode, dan label SELinux file asli, lalu menggantikan file asli secara atomik (`os.replace`). Disk penuh atau proses mati tidak bisa meninggalkan sudoers/sshd_config kosong. |
+| Validasi | File sementara divalidasi **sebelum** menyentuh file asli (`visudo -cf <tmp>`, `sshd -t -f <tmp>`), lalu konfigurasi lengkap divalidasi lagi (`visudo -cf /etc/sudoers`, `sshd -t`). |
+| Exit code | Perintah dijalankan lewat `subprocess` dengan daftar argumen (tanpa shell), `LC_ALL=C`, batas waktu, dan **exit code asli**. `public.ExecShell` sengaja tidak dipakai karena tidak mengembalikan exit code, sehingga validator selalu terlihat berhasil. |
+| Rollback | Jika validasi gagal, isi file dikembalikan dan API mengembalikan `status:false` beserta pesan aslinya. Untuk SSH, nilai efektif dicek **sebelum** reload, jadi rollback tidak pernah meninggalkan daemon dengan config berbeda. |
+| Verifikasi | Pemeriksaan dijalankan ulang; UI menampilkan status baru, bukan asumsi "berhasil". `passwd -l` dianggap berhasil hanya jika `/etc/shadow` benar-benar berubah. |
 | Riwayat | Setiap aksi dicatat di `data/fix.log` (JSON lines) dan bisa di-*restore* dari panel. Backup dipangkas otomatis ke 40 terbaru. |
+| Restore | Backup divalidasi dulu (`visudo`/`sshd -t`) dan sshd di-reload sesudahnya. Jika file sudah diubah lagi setelah fix (hash disimpan saat fix), restore ditolak kecuali dikonfirmasi (`force=1`). Akun yang dikunci tidak pernah dibuka lewat restore. |
 
 ## Daftar pemeriksaan
 
@@ -86,11 +88,11 @@ Yang ikut menyesuaikan:
 | id | Temuan | Level | Aksi |
 |---|---|---|---|
 | `cli_timeout` | `TMOUT` tidak diset / > 600 detik | medium | **Auto** — menambah `TMOUT=300`, `readonly TMOUT`, `export TMOUT` ke `/etc/profile` (atau memperbaiki nilai yang ada) |
-| `sudo_nopasswd` | Ada `NOPASSWD:` di `/etc/sudoers` atau `/etc/sudoers.d/*` | medium | **Auto** — mengomentari baris tersebut (termasuk baris lanjutan `\`), lalu `visudo -c` |
+| `sudo_nopasswd` | Ada `NOPASSWD:` di `/etc/sudoers` atau `/etc/sudoers.d/*` | medium | **Auto** — hanya tag `NOPASSWD:` yang dihapus, rule-nya tetap. Rule yang usernya tidak punya password (mis. `ubuntu`/`ec2-user` di image cloud), alias, atau `ALL` **dilewati** supaya tidak kehilangan akses sudo |
 | `ssh_root_login` | `PermitRootLogin yes` | medium | **Auto** — diubah ke `prohibit-password`, `sshd -t`, reload sshd |
-| `ssh_password_auth` | `PasswordAuthentication yes` | medium | **Auto (berisiko)** — diubah ke `no`; butuh centang konfirmasi karena bisa mengunci login |
-| `file_permissions` | `/etc/shadow`, `/etc/sudoers`, dll. terlalu terbuka | high/medium | **Auto** — `chmod` ke mode standar (hanya bila mode lebih longgar dari seharusnya) |
-| `empty_password` | Akun di `/etc/shadow` tanpa hash | high | **Auto** — `passwd -l <user>` |
+| `ssh_password_auth` | `PasswordAuthentication yes` | medium | **Auto (berisiko)** — diubah ke `no`; backend menolak tanpa `confirm=1` (UI: centang konfirmasi) karena bisa mengunci login |
+| `file_permissions` | `/etc/shadow`, `/etc/sudoers`, dll. terlalu terbuka atau bukan milik root | high/medium | **Auto** — hanya bit berlebih yang dicabut, owner dikembalikan ke root. `0640 root:shadow` (bawaan Debian/Ubuntu untuk `unix_chkpwd`) diterima |
+| `empty_password` | Akun di `/etc/shadow` tanpa hash | high | **Auto** — `passwd -l <user>`, lalu `/etc/shadow` dibaca ulang untuk memastikan |
 | `firewall` | Tidak ada ufw/firewalld/iptables aktif | medium | Manual — perintah backend firewall distro ditampilkan untuk dicopy |
 | `fail2ban` | Tidak terpasang / tidak jalan | medium | Manual — perintah instalasi sesuai paket manager (RHEL: EPEL dulu) |
 | `selinux` | SELinux *permissive*/*disabled* (khusus RHEL family) | medium | Manual — `setenforce 1`; untuk `disabled` butuh reboot + relabel |
@@ -109,6 +111,7 @@ curl -s -X POST 'http://SERVER:8888/plugin?action=a&name=securityrisk&s=get_inde
 
 # perbaiki satu temuan
 curl -s -X POST 'http://SERVER:8888/plugin?action=a&name=securityrisk&s=fix' -d 'id=sudo_nopasswd'
+curl -s -X POST 'http://SERVER:8888/plugin?action=a&name=securityrisk&s=fix' -d 'id=ssh_password_auth&confirm=1'
 
 # riwayat perbaikan
 curl -s -X POST 'http://SERVER:8888/plugin?action=a&name=securityrisk&s=get_history'
@@ -119,7 +122,9 @@ curl -s -X POST 'http://SERVER:8888/plugin?action=a&name=securityrisk&s=restore'
 ```
 
 `restore` menolak `backup` yang tidak cocok dengan pola id (anti path
-traversal). Nama parameter `action`, `s`, `name`, `a` tidak dipakai di body,
+traversal), mengabaikan entri manifest di luar `/etc/` atau di luar folder
+backup-nya, dan mengembalikan `drift` bila file sudah berubah sejak fix (kirim
+ulang dengan `force=1` untuk tetap menimpa). Nama parameter `action`, `s`, `name`, `a` tidak dipakai di body,
 sesuai catatan dokumentasi.
 
 **Kontrol akses.** Semua request dari UI lewat router `/plugin?action=...` yang
@@ -127,7 +132,12 @@ mewarisi session panel. Route pintas `/{plugin}/{method}.json` yang dijelaskan
 dokumentasi *tidak* mewarisi session, jadi kelas plugin mendefinisikan
 `_check()` yang hanya mengizinkan request dengan session panel aktif — tanpa
 itu siapa pun bisa memanggil `fix` dan mengubah `/etc/sudoers` tanpa login.
-`SECRISK_ALLOW_ANON=1` hanya untuk debugging lokal.
+`SECRISK_ALLOW_ANON=1` hanya berlaku bila `SECRISK_SYSROOT` juga diset (mode uji),
+jadi tidak bisa membuka server sungguhan.
+
+**CSRF.** UI mengirim token panel (`x-http-token` + `request_token`). Selain itu
+`fix` dan `restore` menolak request browser yang `Origin`/`Referer`-nya bukan
+host panel (termasuk `X-Forwarded-Host` bila di belakang reverse proxy).
 
 ## Instalasi
 
@@ -154,12 +164,13 @@ Rule engine tidak bergantung pada path absolut, sehingga bisa diuji di mesin
 pengembang dengan `SECRISK_SYSROOT`:
 
 ```bash
-python tests/test_local.py     # 84 assertion: deteksi, fix, backup, restore, profil OS
+python tests/test_local.py     # 133 assertion: deteksi, fix, validator, backup, restore, profil OS
 python tools/make_preview.py   # preview/index.html + data contoh untuk review UI
 ```
 
-Hasil uji terakhir: **84 passed, 0 failed** — mencakup deteksi awal, penulisan
-`TMOUT`, komentar `NOPASSWD` (termasuk baris lanjutan `\`), penguncian akun,
+Hasil uji terakhir: **133 passed, 0 failed** — mencakup deteksi awal, penulisan
+`TMOUT`, penghapusan tag `NOPASSWD` (termasuk baris lanjutan `\`) dan rule
+yang dilewati, validator berbasis exit code, rollback, penguncian akun,
 penulisan ulang sshd_config (termasuk saat nilainya berasal dari
 `sshd_config.d`), aturan permission, riwayat, restore byte-for-byte, plus tiga
 fixture distro:

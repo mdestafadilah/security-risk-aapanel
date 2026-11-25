@@ -317,17 +317,18 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
     {id:'sudo_nopasswd', title:'The following sudo files contain the NOPASSWD flag: /etc/sudoers, /etc/sudoers.d/90-cloud-init-users',
      level:'medium', status:'risk', fixable:true, danger:false,
      detail:'Passwordless sudo is allowed by 3 rule(s): /etc/sudoers, /etc/sudoers.d/90-cloud-init-users',
-     solution:'Comment out or remove the NOPASSWD marker in the listed files. Sudo will then ask for the user password again. Validate with "visudo -c". On this distribution the admin group is "%sudo", so keep the group rule and drop only the NOPASSWD part.',
-     plan:['Back up /etc/sudoers, /etc/sudoers.d/90-cloud-init-users',
-           'Comment out every line that contains NOPASSWD:',
-           'Validate the result with "visudo -c" and roll back if it fails',
-           '  /etc/sudoers:4  %sudo ALL=(ALL:ALL) NOPASSWD: ALL',
-           '  /etc/sudoers:5  bob ALL=(ALL) NOPASSWD: ALL, PASSWD: /bin/ls',
-           '  /etc/sudoers.d/90-cloud-init-users:1  cloud-init ALL=(ALL) NOPASSWD: ALL'],
+     solution:'Remove the NOPASSWD tag so sudo asks for the user password again; keep the rule itself. On this distribution the admin group is "%sudo". Users without a password must get one first ("passwd <user>"), otherwise they lose sudo entirely.',
+     plan:['Back up /etc/sudoers',
+           'Remove only the NOPASSWD: tag, the rule itself stays',
+           'Validate the new file with "visudo -cf" before it replaces the old one',
+           '  change /etc/sudoers:4  %sudo ALL=(ALL:ALL) NOPASSWD: ALL',
+           '  change /etc/sudoers:5  bob ALL=(ALL) NOPASSWD: ALL, PASSWD: /bin/ls',
+           '  skip   /etc/sudoers.d/90-cloud-init-users:1  no usable password for ubuntu'],
      commands:[],
-     rules:[{file:'/etc/sudoers', line:4, text:'%sudo ALL=(ALL:ALL) NOPASSWD: ALL'},
-            {file:'/etc/sudoers', line:5, text:'bob ALL=(ALL) NOPASSWD: ALL, \\'},
-            {file:'/etc/sudoers.d/90-cloud-init-users', line:1, text:'cloud-init ALL=(ALL) NOPASSWD: ALL'}]},
+     rules:[{file:'/etc/sudoers', line:4, text:'%sudo ALL=(ALL:ALL) NOPASSWD: ALL', skip:''},
+            {file:'/etc/sudoers', line:5, text:'bob ALL=(ALL) NOPASSWD: ALL, \\', skip:''},
+            {file:'/etc/sudoers.d/90-cloud-init-users', line:1, text:'ubuntu ALL=(ALL) NOPASSWD: ALL',
+             skip:'no usable password for ubuntu'}]},
     {id:'ssh_password_auth', title:'SSH accepts password authentication', level:'medium',
      status:'risk', fixable:true, danger:true,
      detail:'PasswordAuthentication yes (from /etc/ssh/sshd_config). Brute-force attacks against passwords are the most common way servers get compromised.',
@@ -459,13 +460,34 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
     return Math.floor(s / 86400) + ' d ago';
   }
 
+  // aaPanel's anti-CSRF token: the panel exposes it in a few places depending on
+  // the version; send it the way the panel's own requests do
+  function panelToken() {
+    var docs = [document];
+    try { if (window.parent && window.parent !== window) docs.push(window.parent.document); } catch (e) {}
+    for (var i = 0; i < docs.length; i++) {
+      var el = docs[i].getElementById('request_token_head');
+      if (el && el.getAttribute('token')) return el.getAttribute('token');
+    }
+    try { if (window.parent && window.parent.vite_public_request_token) return window.parent.vite_public_request_token; } catch (e) {}
+    if (window.vite_public_request_token) return window.vite_public_request_token;
+    var m = document.cookie.match(/(?:^|;\s*)request_token=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+
   function req(method, data) {
     var body = new URLSearchParams();
     Object.keys(data || {}).forEach(function (k) { body.append(k, data[k]); });
+    var headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+    var token = panelToken();
+    if (token) {
+      headers['x-http-token'] = token;
+      body.append('request_token', token);
+    }
     return fetch(API + method, {
       method: 'POST',
       credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      headers: headers,
       body: body.toString()
     }).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -584,7 +606,8 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
     if (item.rules && item.rules.length) {
       rules = '<ul class="rules">' + item.rules.slice(0, 4).map(function (r) {
         return '<li><span class="loc">' + esc(r.file) + ':' + esc(r.line) + '</span>  ' +
-               esc(r.text) + '</li>';
+               esc(r.text) +
+               (r.skip ? '<br><span class="loc">skipped: ' + esc(r.skip) + '</span>' : '') + '</li>';
       }).join('') + '</ul>';
     }
 
@@ -707,16 +730,18 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
               return;
             }
           }
-          applyFix(id);
+          applyFix(id, item.danger);
         };
       }
     });
   }
 
-  function applyFix(id) {
+  function applyFix(id, confirmed) {
     var btn = $('mApply');
     if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
-    req('fix', { id: id }).then(function (res) {
+    var data = { id: id };
+    if (confirmed) data.confirm = '1';
+    req('fix', data).then(function (res) {
       if (!res || res.status === false) {
         toast('Fix failed', (res && res.msg) || 'Unknown error', 'err');
         closeModal();
@@ -807,21 +832,41 @@ footer code{background:#eef0f4;border-radius:4px;padding:1px 5px;font-size:11.5p
     });
   }
 
-  function restore(bid) {
+  function restore(bid, drift) {
+    var warn = drift
+      ? '<div class="warn"><span>▲</span><div><b>Changed after the fix</b>' +
+        esc(drift.join(', ')) + ' changed after this fix was applied. Restoring ' +
+        'overwrites those later edits too.</div></div>' +
+        '<label class="confirm-line"><input type="checkbox" id="driftOk"> ' +
+        'Overwrite the later changes</label>'
+      : '<div class="warn"><span>▲</span><div><b>Validated before it is applied</b>' +
+        'sudoers is checked with <code>visudo -c</code> and sshd_config with ' +
+        '<code>sshd -t</code>; a rejected backup is not written. Locked accounts ' +
+        'are never unlocked by a restore.</div></div>';
     openModal({
       title: 'Restore backup',
       sub: 'Files from this backup will be written back and the plugin will rescan.',
-      body: '<ul class="plan"><li><i>1</i><span>Copy the saved file(s) back to their original path</span></li>' +
-            '<li><i>2</i><span>Restore the original file mode</span></li>' +
-            '<li><i>3</i><span>Re-run the security scan</span></li></ul>' +
-            '<div class="warn"><span>▲</span><div><b>Check the service afterwards</b>' +
-            'If you restore sudoers or sshd_config, run <code>visudo -c</code> and <code>sshd -t</code>.</div></div>',
+      body: '<ul class="plan"><li><i>1</i><span>Validate the saved file(s)</span></li>' +
+            '<li><i>2</i><span>Write them back with the original file mode</span></li>' +
+            '<li><i>3</i><span>Reload sshd when sshd_config changed, then rescan</span></li></ul>' + warn,
       foot: '<button type="button" class="btn btn-ghost" data-close="1">Cancel</button>' +
-            '<button type="button" class="btn btn-primary" id="mApply">Restore</button>',
+            '<button type="button" class="btn ' + (drift ? 'btn-danger' : 'btn-primary') +
+            '" id="mApply">Restore</button>',
       onReady: function () {
         $('mApply').onclick = function () {
+          if (drift && !($('driftOk') && $('driftOk').checked)) {
+            toast('Confirmation needed', 'Tick the checkbox to overwrite the later changes.', 'warn');
+            return;
+          }
           this.disabled = true; this.textContent = 'Restoring…';
-          req('restore', { backup: bid }).then(function (res) {
+          var data = { backup: bid };
+          if (drift) data.force = '1';
+          req('restore', data).then(function (res) {
+            if (res && res.status === false && res.drift && !drift) {
+              closeModal();
+              restore(bid, res.drift);
+              return;
+            }
             if (!res || res.status === false) throw new Error((res && res.msg) || 'Restore failed');
             toast('Restored', res.msg || 'Backup applied.');
             closeModal();
